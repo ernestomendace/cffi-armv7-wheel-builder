@@ -1,0 +1,11 @@
+# Minimal CFFI ARMv7 wheel build
+
+This directory contains only a pinned build recipe for the public CFFI 2.0.0 source and public build tools. It contains no application source, private configuration, credentials, or user data.
+
+The workflow targets CPython 3.9 on the official PyPA `manylinux_2_31_armv7l` image, pinned by digest, under ARMv7 emulation. It hash-checks CFFI 2.0.0 and the pure-Python build tools before the container build. The linker is asked for 32 KiB maximum page alignment. `audit_repaired_wheel.py` parses wheel filename fields and platform tags, requires exactly one CFFI 2.0.0/cp39/cp39 candidate including `manylinux_2_31_armv7l`, verifies the wheel's internal tags and RECORD hashes, and audits the extension plus packaged ELF libraries for ARM hard-float, PT_LOAD alignment and GLIBC ceiling. It resolves libffi as either one hash-verified bundled ELF or the exact external `libffi.so.8`, then audits that library's ABI and records its SHA-256. The workflow also runs `auditwheel show`, installs the wheel into an isolated target directory, performs an emulated CFFI import/smoke test, and emits the wheel SHA-256 and minimized audit reports.
+
+## Reproducibility and limits
+
+The source archives and Python build wheels, Actions code, QEMU registration image, and manylinux image are pinned. The Actions runner label and GitHub service itself are managed by GitHub; the workflow records actual tool versions. A successful run still needs review of the artifact manifest, confirmation that the deployment target provides the expected libffi runtime ABI, and final import on the target Python 3.9.2. QEMU/ARMv7 support and build runtime are CI-side evidence only, not target execution. These checks are gates, not evidence that a resulting wheel passes.
+
+On success, the workflow emits a size-capped base64 archive containing only the wheel, its SHA-256, and minimized ABI/build audit files in the public run log. This avoids Actions artifact storage. The archive is public and can be reconstructed from that run's logs. Do not add application source, private configuration, credentials, or user data to this repository. The local selector self-tests do not replace the ARM/QEMU post-repair audit; a new Actions run is required to exercise those checks and needs separate authorization.
