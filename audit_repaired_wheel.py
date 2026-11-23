@@ -8,6 +8,7 @@ import io
 import re
 import subprocess
 import sys
+import stat
 import zipfile
 from email.parser import Parser
 from pathlib import Path
@@ -58,15 +59,81 @@ def select_wheel(directory):
     return candidates[0]
 
 
+def _record_member_path(name):
+    if not name or "\x00" in name or "\\" in name or name.startswith("/"):
+        raise AuditError("unsafe RECORD/archive member path")
+    if re.match(r"^[A-Za-z]:", name):
+        raise AuditError("unsafe drive-qualified member path")
+    directory = name.endswith("/")
+    value = name[:-1] if directory else name
+    parts = value.split("/")
+    if not value or any(part in ("", ".", "..") for part in parts):
+        raise AuditError("unsafe RECORD/archive member path")
+    return "/".join(parts), directory
+
+
+def _brief_names(names, limit=5):
+    shown = []
+    for name in sorted(names)[:limit]:
+        cleaned = "".join(ch if ch >= " " and ch != "\x7f" else "?" for ch in name)
+        shown.append(cleaned[:100])
+    if len(names) > limit:
+        shown.append("...(+%d)" % (len(names) - limit))
+    return "[" + ", ".join(shown) + "]"
+
+
 def verify_record(zf, names, record_name):
-    rows = list(csv.reader(io.StringIO(zf.read(record_name).decode("utf-8"))))
+    archive_names = list(names)
+    if archive_names != zf.namelist():
+        raise AuditError("supplied ZIP inventory differs from archive")
+    if len(archive_names) != len(set(archive_names)):
+        raise AuditError("duplicate ZIP member name")
+    regular_files = set()
+    normalized = {}
+    for info in zf.infolist():
+        path, directory = _record_member_path(info.filename)
+        file_type = stat.S_IFMT(info.external_attr >> 16)
+        if directory:
+            if file_type not in (0, stat.S_IFDIR):
+                raise AuditError("directory ZIP member has incompatible file type")
+        else:
+            if file_type not in (0, stat.S_IFREG):
+                raise AuditError("non-regular ZIP member is not accepted")
+        if path in normalized:
+            raise AuditError("duplicate normalized ZIP member path")
+        normalized[path] = directory
+        if not directory:
+            regular_files.add(path)
+
+    try:
+        raw_record = zf.read(record_name).decode("utf-8")
+        rows = list(csv.reader(io.StringIO(raw_record), strict=True))
+    except (KeyError, UnicodeDecodeError, csv.Error) as exc:
+        raise AuditError("RECORD is absent, malformed, or not UTF-8: %s" % type(exc).__name__)
+
     entries = {}
     for row in rows:
-        if len(row) != 3 or row[0] in entries:
+        if len(row) != 3 or not row[0] or row[0] in entries:
             raise AuditError("malformed or duplicate RECORD row")
-        entries[row[0]] = (row[1], row[2])
-    if set(entries) != set(names):
-        raise AuditError("RECORD inventory does not match wheel contents")
+        member, is_directory = _record_member_path(row[0])
+        if is_directory:
+            raise AuditError("RECORD must list files, not directories")
+        entries[member] = (row[1], row[2])
+
+    signature_members = {"RECORD.jws", "RECORD.p7s"}
+    if regular_files & signature_members:
+        raise AuditError("deprecated RECORD signatures are unsupported by this builder")
+    expected_recorded = regular_files
+    if record_name not in expected_recorded:
+        raise AuditError("RECORD file is absent from archive inventory")
+    archive_only = expected_recorded - set(entries)
+    record_only = set(entries) - expected_recorded
+    if archive_only or record_only:
+        raise AuditError(
+            "RECORD inventory mismatch: archive-only=%s; RECORD-only=%s"
+            % (_brief_names(archive_only), _brief_names(record_only))
+        )
+
     for name, (encoded, size) in entries.items():
         if name == record_name:
             if encoded or size:
@@ -76,8 +143,10 @@ def verify_record(zf, names, record_name):
         if not encoded.startswith("sha256="):
             raise AuditError("missing SHA-256 RECORD digest")
         actual = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii")
-        if actual != encoded[7:] or int(size) != len(data):
-            raise AuditError("RECORD digest or size mismatch: %s" % name)
+        if actual != encoded[7:]:
+            raise AuditError("RECORD SHA-256 mismatch: %s" % _brief_names([name]))
+        if not size.isdigit() or int(size) != len(data):
+            raise AuditError("RECORD size mismatch: %s" % _brief_names([name]))
 
 
 def safe_extract(zf, destination):
@@ -242,7 +311,107 @@ def classify_libffi(needed_name, packaged):
     return "external", None
 
 
+def record_self_test():
+    import tempfile
+    import warnings
+
+    def digest_row(name, data):
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii")
+        return [name, "sha256=" + digest, str(len(data))]
+
+    def make_archive(path, files, directories=(), record_rows=None, duplicate_member=None):
+        record_name = "pkg-1.dist-info/RECORD"
+        rows = list(record_rows) if record_rows is not None else [
+            digest_row(name, data) for name, data in files.items()
+        ] + [[record_name, "", ""]]
+        output = io.StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerows(rows)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(str(path), "w") as archive:
+                for directory in directories:
+                    archive.writestr(directory, b"")
+                for name, data in files.items():
+                    archive.writestr(name, data)
+                archive.writestr(record_name, output.getvalue())
+                if duplicate_member:
+                    archive.writestr(*duplicate_member)
+        return record_name
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        files = {
+            "pkg/__init__.py": b"value = 1\n",
+            "pkg-1.dist-info/METADATA": b"Name: pkg\nVersion: 1\n",
+        }
+        good = root / "good.whl"
+        record = make_archive(good, files, ("pkg/", "pkg-1.dist-info/"))
+        with zipfile.ZipFile(str(good)) as archive:
+            verify_record(archive, archive.namelist(), record)
+
+        cases = []
+        extra = dict(files)
+        extra["pkg/unlisted.py"] = b"unlisted\n"
+        base_rows = [digest_row(k, v) for k, v in files.items()] + [["pkg-1.dist-info/RECORD", "", ""]]
+        cases.append(("archive-only", extra, ("pkg/", "pkg-1.dist-info/"), base_rows, "archive-only"))
+        rows = [digest_row(k, v) for k, v in files.items()]
+        rows.append(digest_row("pkg/absent.py", b"absent\n"))
+        rows.append([record, "", ""])
+        cases.append(("record-only", files, ("pkg/", "pkg-1.dist-info/"), rows, "RECORD-only"))
+        bad_hash = [digest_row(k, v) for k, v in files.items()]
+        bad_hash[0][1] = "sha256=AAAA"
+        bad_hash.append([record, "", ""])
+        cases.append(("bad-hash", files, (), bad_hash, "SHA-256 mismatch"))
+        bad_size = [digest_row(k, v) for k, v in files.items()]
+        bad_size[0][2] = "999"
+        bad_size.append([record, "", ""])
+        cases.append(("bad-size", files, (), bad_size, "size mismatch"))
+        duplicate_rows = [digest_row(k, v) for k, v in files.items()]
+        duplicate_rows.append(duplicate_rows[0])
+        duplicate_rows.append([record, "", ""])
+        cases.append(("duplicate-record", files, (), duplicate_rows, "duplicate RECORD row"))
+        malformed_rows = [["not-three-columns"]]
+        cases.append(("malformed-record", files, (), malformed_rows, "malformed or duplicate RECORD row"))
+        for label, members, dirs, rows, expected in cases:
+            path = root / (label + ".whl")
+            rec = make_archive(path, members, dirs, rows)
+            with zipfile.ZipFile(str(path)) as archive:
+                try:
+                    verify_record(archive, archive.namelist(), rec)
+                except AuditError as exc:
+                    if expected not in str(exc):
+                        raise AssertionError("%s produced unexpected failure: %s" % (label, exc))
+                else:
+                    raise AssertionError("%s invalid RECORD accepted" % label)
+
+        path = root / "duplicate.zip"
+        rec = make_archive(path, files, duplicate_member=("pkg/__init__.py", b"duplicate"))
+        with zipfile.ZipFile(str(path)) as archive:
+            try:
+                verify_record(archive, archive.namelist(), rec)
+            except AuditError as exc:
+                assert "duplicate ZIP member name" in str(exc)
+            else:
+                raise AssertionError("duplicate ZIP entry accepted")
+
+        for unsafe in ("../escape", "/absolute", "C:/drive", "pkg\\escape"):
+            path = root / "unsafe.zip"
+            unsafe_files = dict(files)
+            unsafe_files[unsafe] = b"bad\n"
+            rec = make_archive(path, unsafe_files)
+            with zipfile.ZipFile(str(path)) as archive:
+                try:
+                    verify_record(archive, archive.namelist(), rec)
+                except AuditError as exc:
+                    assert "unsafe" in str(exc)
+                else:
+                    raise AssertionError("unsafe path accepted: %s" % unsafe)
+    print("RECORD inventory/hash/size self-test: PASS")
+
+
 def self_test():
+    record_self_test()
     good = "cffi-2.0.0-cp39-cp39-manylinux2014_armv7l.manylinux_2_17_armv7l.manylinux_2_31_armv7l.whl"
     wheel_fields(good)
     wheel_fields("cffi-2.0.0-cp39-cp39-manylinux_2_31_armv7l.manylinux2014_armv7l.manylinux_2_17_armv7l.whl")
@@ -317,7 +486,7 @@ def main():
                 raise AuditError("--audit requires --extract-to and --report-dir")
             audit_wheel(args.audit, args.extract_to, args.report_dir)
             print("strict wheel/ELF/RECORD/libffi audit: PASS")
-    except (AuditError, OSError, ValueError, zipfile.BadZipFile) as exc:
+    except (AuditError, OSError, ValueError, csv.Error, UnicodeDecodeError, zipfile.BadZipFile) as exc:
         print("wheel audit failed: %s" % exc, file=sys.stderr)
         return 2
     return 0
