@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "target": {
+    "image": "quay.io/pypa/manylinux_2_31_armv7l@sha256:ecb0b7cd6db693d46a399226fd93cfd0d01d0dfbf9c65a8d5a0f6821767178fe",
+    "platform": "linux/arm/v7",
+    "python": "/opt/python/cp39-cp39/bin/python3.9"
+  },
+  "cffi_audit_source": {
+    "run_id": 45214904747,
+    "archive_sha256": "130eb792089a619b2a5a9ecdf4ca7bddec7bb9b3fc9434e69bafc24f8fc6d74a",
+    "wheel": "cffi-2.0.0-cp39-cp39-manylinux2014_armv7l.manylinux_2_17_armv7l.manylinux_2_31_armv7l.whl",
+    "wheel_sha256": "8baf280c3a47576fdd58cdc5a1018ad2f8adec2697801d0dbb04d91d6ead34f8"
+  },
+  "wheels": [
+    {
+      "name": "cryptography",
+      "version": "50.0.2",
+      "filename": "cryptography-50.0.2-cp39-abi3-manylinux_2_31_armv7l.whl",
+      "sha256": "9c8402a82ea0dc4ceeab793db05f0fafa8ca139ca34fcde5df0f596103c74107"
+    },
+    {
+      "name": "pycparser",
+      "version": "2.23",
+      "filename": "pycparser-2.23-py3-none-any.whl",
+      "sha256": "e5c6e8d3fbad53479cab09ac03729e0a9faf2bee3db8208a550daf5af81a5934"
+    },
+    {
+      "name": "pyspnego",
+      "version": "0.12.4",
+      "filename": "pyspnego-0.12.4-py3-none-any.whl",
+      "sha256": "a29a34de1abe9e9b30d9aa1d363f8e49fc159eb7355b1f2ee86ccb3a2ce3bba9"
+    },
+    {
+      "name": "smbprotocol",
+      "version": "1.12.0",
+      "filename": "smbprotocol-1.12.0-py3-none-any.whl",
+      "sha256": "91661e6d08e0712d8cac8922966a6a77fd7bcb38da04a0d8b20f3f5f39034f2e"
+    },
+    {
+      "name": "typing-extensions",
+      "version": "4.15.0",
+      "filename": "typing_extensions-4.15.0-py3-none-any.whl",
+      "sha256": "f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548"
+    }
+  ],
+  "private_source_archive_sha256": "df89867034c4a39eb6f6993e766ce7620f3c3d63ba0168721db05720448d17be"
+}
