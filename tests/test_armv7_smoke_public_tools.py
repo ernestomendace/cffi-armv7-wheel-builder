@@ -36,7 +36,7 @@ class Armv7SmokePublicToolTests(unittest.TestCase):
             root = pathlib.Path(temp)
             staged = root / "staged"
             staged.mkdir()
-            for index in range(46):
+            for index in range(47):
                 (staged / ("file-%02d.py" % index)).write_text("fixture %d\n" % index, encoding="ascii")
             first, second = root / "one.tar.gz", root / "two.tar.gz"
             PACK.deterministic_archive(staged, first)
@@ -255,7 +255,7 @@ class Armv7SmokePublicToolTests(unittest.TestCase):
             run_root.chmod(0o700)
             source = run_root / "private-source"
             source.chmod(0o700)
-            for index in range(46):
+            for index in range(47):
                 (source / ("source-%02d.py" % index)).write_text("fixture\n", encoding="ascii")
             wheelhouse = run_root / "wheelhouse"
             wheelhouse.mkdir()
@@ -268,7 +268,7 @@ class Armv7SmokePublicToolTests(unittest.TestCase):
             results = run_root / "results"
             results.mkdir(mode=0o700)
             (results / "prepare-status.json").write_text(json.dumps({"status": "PASS", "wheel_count": 6,
-                                                                       "private_source_file_count": 46}), encoding="ascii")
+                                                                       "private_source_file_count": 47}), encoding="ascii")
             fake_bin = root / "bin"
             fake_bin.mkdir()
             capture = root / "docker-args.txt"
@@ -314,7 +314,7 @@ class Armv7SmokePublicToolTests(unittest.TestCase):
             run_root.chmod(0o700)
             source = run_root / "private-source"
             source.mkdir(mode=0o700)
-            for index in range(46):
+            for index in range(47):
                 (source / ("source-%02d.py" % index)).write_text("fixture\n", encoding="ascii")
             wheelhouse = run_root / "wheelhouse"
             wheelhouse.mkdir(mode=0o700)
@@ -324,7 +324,7 @@ class Armv7SmokePublicToolTests(unittest.TestCase):
             results = run_root / "results"
             results.mkdir(mode=0o700)
             (results / "prepare-status.json").write_text(json.dumps({"status": "PASS", "wheel_count": 6,
-                                                                       "private_source_file_count": 46}), encoding="ascii")
+                                                                       "private_source_file_count": 47}), encoding="ascii")
             sentinel = results / "preserve-me"
             sentinel.write_text("fixture", encoding="ascii")
             completed = subprocess.run(

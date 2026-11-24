@@ -91,10 +91,11 @@ def _extract_source(archive, destination):
             "tests/test_native_service_coordinator_composition.py",
             "tests/test_native_service_runtime_adapters.py",
             "tools/armv7_offline_bundle_smoke.py",
+            "src/mcp_document_oauth_entrypoint.py",
         )
         if count < 1 or any(not destination.joinpath(*p.split("/")).is_file() for p in required):
             raise InputError("SOURCE_REQUIRED_FILE_MISSING")
-    if count != 46:
+    if count != 47:
         raise InputError("SOURCE_INVENTORY_COUNT_MISMATCH")
 
 
@@ -214,7 +215,7 @@ def prepare(root, lock_path):
     (root / "requirements.lock").write_text(
         "\n".join(requirements_lock_lines(lock)) + "\n", encoding="ascii")
     (results / "prepare-status.json").write_text(
-        json.dumps({"status": "PASS", "wheel_count": 6, "private_source_file_count": 46},
+        json.dumps({"status": "PASS", "wheel_count": 6, "private_source_file_count": 47},
                    sort_keys=True) + "\n", encoding="ascii")
 
 

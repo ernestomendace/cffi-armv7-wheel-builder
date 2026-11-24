@@ -67,7 +67,7 @@ if (not stat.S_ISREG(status_stat.st_mode) or stat.S_ISLNK(status_stat.st_mode)
         or status_stat.st_uid != uid or status_stat.st_gid != gid
         or stat.S_IMODE(status_stat.st_mode) & 0o022
         or status.get("status") != "PASS" or status.get("wheel_count") != 6
-        or status.get("private_source_file_count") != 46):
+        or status.get("private_source_file_count") != 47):
     reject("PREPARE_STATUS_INVALID")
 wheel_files = list((root / "wheelhouse").iterdir())
 if len(wheel_files) != 6 or any(path.is_symlink() or not path.is_file() or path.suffix != ".whl"
@@ -87,7 +87,7 @@ for path in (root / "private-source").rglob("*"):
             reject("PRIVATE_SOURCE_UNREADABLE")
     elif not stat.S_ISDIR(info.st_mode):
         reject("PRIVATE_SOURCE_ENTRY_INVALID")
-if source_files != 46:
+if source_files != 47:
     reject("PRIVATE_SOURCE_INVENTORY_INVALID")
 PY
 then

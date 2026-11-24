@@ -23,7 +23,7 @@ def deterministic_archive(staged, archive_path):
     files = [p for p in entries if p.is_file() and not p.is_symlink()]
     if any(p.is_symlink() for p in entries) or any(not (p.is_file() or p.is_dir()) for p in entries):
         raise ValueError("PRIVATE_SOURCE_ENTRY_TYPE_INVALID")
-    if len(files) != 46 or len(files) > MAX_SOURCE_FILES:
+    if len(files) != 47 or len(files) > MAX_SOURCE_FILES:
         raise ValueError("PRIVATE_SOURCE_FILE_COUNT_INVALID")
     total = sum(p.stat().st_size for p in files)
     if total > MAX_SOURCE_BYTES:

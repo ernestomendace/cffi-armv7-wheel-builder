@@ -6,7 +6,7 @@ The workflow has only `workflow_dispatch`; it uses the standard `ubuntu-24.04` r
 
 ## Private source preparation
 
-From a trusted local checkout of the MCP project, use the public `package_private_source.py` and the project’s existing curated staging script. Choose a private output directory with mode 0700. The command writes seven 0600 text files, each at most 40,000 Base64 characters, plus a private summary. It does not print chunk contents. Confirm that the summary SHA-256 equals `private_source_archive_sha256` in `wheel-lock.json`; stop if it does not.
+From a trusted local checkout of the MCP project, use the public `package_private_source.py` and the project’s existing curated staging script. Choose a private output directory with mode 0700. The command writes eight 0600 text files, each at most 40,000 Base64 characters, plus a private summary. It does not print chunk contents. The selected source archive contains exactly 47 regular files and remains subject to the explicit import-closure selection, archive size limit, path checks, and digest verification. Confirm that the summary SHA-256 equals `private_source_archive_sha256` in `wheel-lock.json`; stop if it does not.
 
 Create these repository Actions secrets, pasting each corresponding local chunk file into the secret value:
 
