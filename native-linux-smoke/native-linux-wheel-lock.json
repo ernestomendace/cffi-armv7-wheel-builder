@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "runtime": {
+    "platform": "linux/amd64",
+    "python": "3.9.25",
+    "image": "python:3.9.25-slim-bookworm@sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+    "image_index_sha256": "a02e9c5406c416c504d6c9a1a306ff4080c3173f1008d192f953bd20382a2d5c"
+  },
+  "private_source": {
+    "archive_sha256": "3aa8e448465243b5e455a9b113f2a6647870069eb7b593fb2dc4cb804c66e029",
+    "archive_bytes": 227442,
+    "file_count": 47,
+    "base64_parts": 8,
+    "part_characters_max": 40000
+  },
+  "wheels": [
+    {"name":"cffi","version":"2.0.0","filename":"cffi-2.0.0-cp39-cp39-manylinux2014_x86_64.manylinux_2_17_x86_64.whl","sha256":"61d028e90346df14fedc3d1e5441df818d095f3b87d286825dfcbd6459b7ef63"},
+    {"name":"cryptography","version":"50.0.2","filename":"cryptography-50.0.2-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl","sha256":"ee247f5c245c9a2fe7c8e2214e295918838e44e00a45a6718451e4004219e767"},
+    {"name":"pycparser","version":"2.23","filename":"pycparser-2.23-py3-none-any.whl","sha256":"e5c6e8d3fbad53479cab09ac03729e0a9faf2bee3db8208a550daf5af81a5934"},
+    {"name":"pyspnego","version":"0.12.4","filename":"pyspnego-0.12.4-py3-none-any.whl","sha256":"a29a34de1abe9e9b30d9aa1d363f8e49fc159eb7355b1f2ee86ccb3a2ce3bba9"},
+    {"name":"smbprotocol","version":"1.12.0","filename":"smbprotocol-1.12.0-py3-none-any.whl","sha256":"91661e6d08e0712d8cac8922966a6a77fd7bcb38da04a0d8b20f3f5f39034f2e"},
+    {"name":"typing-extensions","version":"4.15.0","filename":"typing_extensions-4.15.0-py3-none-any.whl","sha256":"f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548"}
+  ]
+}

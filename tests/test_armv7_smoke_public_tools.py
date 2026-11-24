@@ -30,7 +30,95 @@ DECRYPT = load_script("decrypt_diagnostics.py")
 RECOVER = load_script("recover_diagnostics.py")
 RUNNER = load_script("container_runner.py")
 
+def load_native_script(name):
+    path = ROOT / "native-linux-smoke" / name
+    spec = importlib.util.spec_from_file_location("native_" + name.replace(".py", ""), str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+NATIVE_PREP = load_native_script("prepare_native_inputs.py")
+NATIVE_RUNNER = load_native_script("native_linux_runner.py")
+
 class Armv7SmokePublicToolTests(unittest.TestCase):
+    def test_native_linux_lock_is_separate_and_pins_six_x86_64_distributions(self):
+        lock_path = ROOT / "native-linux-smoke" / "native-linux-wheel-lock.json"
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        rows = lock["wheels"]
+        self.assertEqual(lock["runtime"]["platform"], "linux/amd64")
+        self.assertIn("@sha256:", lock["runtime"]["image"])
+        self.assertEqual(len(rows), 6)
+        self.assertTrue(any("cp39-cp39-manylinux2014_x86_64" in row["filename"] for row in rows
+                            if row["name"] == "cffi"))
+        self.assertTrue(any("cp39-abi3-manylinux2014_x86_64" in row["filename"] for row in rows
+                            if row["name"] == "cryptography"))
+        requirements = NATIVE_PREP._requirements(lock)
+        self.assertEqual(len(requirements.splitlines()), 6)
+        for row in rows:
+            self.assertIn("%s==%s --hash=sha256:%s" %
+                          (row["name"], row["version"], row["sha256"]), requirements)
+        self.assertRegex(lock["private_source"]["archive_sha256"], r"^[0-9a-f]{64}$")
+        arm = json.loads((ROOT / "armv7-smoke" / "wheel-lock.json").read_text(encoding="utf-8"))
+        arm_cffi = next(row for row in arm["wheels"] if row["name"] == "cryptography")
+        self.assertIn("armv7l", arm_cffi["filename"])
+        self.assertIn("x86_64", next(row for row in rows if row["name"] == "cryptography")["filename"])
+
+    def test_native_workflow_is_manual_x86_linux_and_disables_test_network(self):
+        path = ROOT / ".github" / "workflows" / "native-linux-mcp-smoke.yml"
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", text)
+        self.assertIn("runs-on: ubuntu-24.04", text)
+        self.assertIn("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", text)
+        self.assertIn("run_native_container.sh", text)
+        for index in range(1, 9):
+            self.assertIn("MCP_NATIVE_LINUX_SOURCE_B64_%02d" % index, text)
+        self.assertIn("MCP_NATIVE_LINUX_DIAGNOSTIC_KEY_HEX", text)
+        self.assertNotIn("MCP_ARMV7_SOURCE_B64_01", text)
+        runner = (ROOT / "native-linux-smoke" / "run_native_container.sh").read_text()
+        self.assertIn("--platform linux/amd64 --network none", runner)
+        self.assertIn("--cap-drop ALL --security-opt no-new-privileges:true", runner)
+        self.assertIn("python:3.9.25-slim-bookworm@sha256:", runner)
+        self.assertNotIn("setup-qemu", text.lower())
+
+    def test_native_private_archive_extraction_is_explicit_and_safe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            archive_path = root / "source.tar.gz"
+            entries = {
+                "src/mcp_document_oauth_entrypoint.py":b"# fixture\n",
+                "tools/native_service_cycle.py":b"# fixture\n",
+                "tests/test_native_service_real_gateway_e2e.py":b"# fixture\n",
+                "config/mcp-oauth-runtime.example.json":b"{}\n",
+            }
+            for index in range(43):
+                entries["fixture/%02d.txt" % index] = b"synthetic\n"
+            with tarfile.open(str(archive_path), "w:gz") as archive:
+                for name, data in entries.items():
+                    member = tarfile.TarInfo(name); member.size = len(data)
+                    archive.addfile(member, io.BytesIO(data))
+            target = root / "unpacked"
+            NATIVE_PREP._extract_source(archive_path.read_bytes(), target, 47)
+            self.assertEqual((target / "src/mcp_document_oauth_entrypoint.py").read_bytes(), b"# fixture\n")
+            self.assertEqual((target / "src/mcp_document_oauth_entrypoint.py").stat().st_mode & 0o777, 0o600)
+
+    def test_native_private_archive_extraction_rejects_parent_escape_and_links(self):
+        for entry_type in ("escape", "symlink"):
+            with self.subTest(entry_type=entry_type), tempfile.TemporaryDirectory() as temp:
+                root = pathlib.Path(temp)
+                archive_path = root / "bad.tar.gz"
+                with tarfile.open(str(archive_path), "w:gz") as archive:
+                    member = tarfile.TarInfo("../outside.txt" if entry_type == "escape" else "linked.txt")
+                    if entry_type == "symlink":
+                        member.type = tarfile.SYMTYPE
+                        member.linkname = "/etc/passwd"
+                        archive.addfile(member)
+                    else:
+                        data = b"blocked"
+                        member.size = len(data)
+                        archive.addfile(member, io.BytesIO(data))
+                with self.assertRaisesRegex(NATIVE_PREP.PrepareError, "SOURCE_PATH|SOURCE_NON_REGULAR"):
+                    NATIVE_PREP._extract_source(archive_path.read_bytes(), root / "out", 47)
+
     def test_source_packaging_is_deterministic_and_0700(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)

@@ -1,0 +1,73 @@
+name: Native Linux x86-64 MCP identity and lifecycle smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-linux-mcp-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout public harness only
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Recover source and download hash-locked x86-64 wheels
+        id: prepare
+        continue-on-error: true
+        shell: bash
+        env:
+          SOURCE_PART_01: ${{ secrets.MCP_NATIVE_LINUX_SOURCE_B64_01 }}
+          SOURCE_PART_02: ${{ secrets.MCP_NATIVE_LINUX_SOURCE_B64_02 }}
+          SOURCE_PART_03: ${{ secrets.MCP_NATIVE_LINUX_SOURCE_B64_03 }}
+          SOURCE_PART_04: ${{ secrets.MCP_NATIVE_LINUX_SOURCE_B64_04 }}
+          SOURCE_PART_05: ${{ secrets.MCP_NATIVE_LINUX_SOURCE_B64_05 }}
+          SOURCE_PART_06: ${{ secrets.MCP_NATIVE_LINUX_SOURCE_B64_06 }}
+          SOURCE_PART_07: ${{ secrets.MCP_NATIVE_LINUX_SOURCE_B64_07 }}
+          SOURCE_PART_08: ${{ secrets.MCP_NATIVE_LINUX_SOURCE_B64_08 }}
+        run: python3 native-linux-smoke/prepare_native_inputs.py --root "$RUNNER_TEMP/native-linux"
+
+      - name: Run native Linux tests with network disabled
+        id: smoke
+        if: steps.prepare.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: bash native-linux-smoke/run_native_container.sh "$RUNNER_TEMP/native-linux"
+
+      - name: Encrypt private diagnostics
+        id: encrypt
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          MCP_DIAGNOSTIC_KEY_HEX: ${{ secrets.MCP_NATIVE_LINUX_DIAGNOSTIC_KEY_HEX }}
+        run: python3 armv7-smoke/encrypt_report.py --root "$RUNNER_TEMP/native-linux/results"
+
+      - name: Publish status only
+        if: always()
+        shell: bash
+        env:
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+          ENCRYPT_OUTCOME: ${{ steps.encrypt.outcome }}
+        run: |
+          printf 'Input preparation: %s\nNative Linux smoke: %s\nEncrypted diagnostics: %s\n' \
+            "$PREPARE_OUTCOME" "$SMOKE_OUTCOME" "$ENCRYPT_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$PREPARE_OUTCOME" != success || "$SMOKE_OUTCOME" != success || "$ENCRYPT_OUTCOME" != success ]]; then
+            exit 1
+          fi
+
+      - name: Remove private runner workspace
+        if: always()
+        shell: bash
+        run: |
+          TARGET="$RUNNER_TEMP/native-linux"
+          case "$TARGET" in "$RUNNER_TEMP"|/|"") exit 1 ;; esac
+          if [[ -L "$TARGET" ]]; then exit 1; fi
+          rm -rf -- "$TARGET"
