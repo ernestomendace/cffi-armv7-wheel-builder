@@ -28,6 +28,24 @@ def need(condition, code):
         raise RuntimeError(code)
 
 
+def resolve_checked_input(raw, expected_kind):
+    """Reject symlinks in the supplied path before resolving any component."""
+    path = pathlib.Path(raw)
+    need(path.is_absolute() and ".." not in path.parts, "INPUT_PATH_INVALID")
+    current = pathlib.Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        info = os.lstat(str(current))
+        need(not stat.S_ISLNK(info.st_mode), "INPUT_SYMLINK_INVALID")
+    resolved = path.resolve(strict=True)
+    info = os.lstat(str(resolved))
+    if expected_kind == "directory":
+        need(stat.S_ISDIR(info.st_mode), "INPUT_PATH_TYPE_INVALID")
+    else:
+        need(stat.S_ISREG(info.st_mode), "INPUT_PATH_TYPE_INVALID")
+    return resolved
+
+
 def read_text(path):
     try:
         return pathlib.Path(path).read_text(encoding="ascii")
@@ -150,7 +168,8 @@ def tree_memory(pid, rows):
                 members.add(child); changed = True
     rss = sum(rows[p][1] for p in members if p in rows)
     pss_values = [rows[p][2] for p in members if p in rows and rows[p][2] is not None]
-    return rss, (sum(pss_values) if pss_values else None), len(members)
+    pss_complete = len(pss_values) == len(members)
+    return rss, (sum(pss_values) if pss_complete else None), len(members)
 
 
 def run_measured(name, command, env, cwd, log_path, metrics, cg):
@@ -222,10 +241,11 @@ def main():
     parser.add_argument("--site", default="/mcp-native-site")
     parser.add_argument("--tmp", default="/mcp-native-test-tmp")
     args = parser.parse_args()
-    source = pathlib.Path(args.source).resolve(strict=True)
-    wheelhouse = pathlib.Path(args.wheelhouse).resolve(strict=True)
-    requirements_path = pathlib.Path(args.requirements).resolve(strict=True)
-    results = pathlib.Path(args.results).resolve(strict=True)
+    source = pathlib.Path(args.source)
+    wheelhouse = pathlib.Path(args.wheelhouse)
+    requirements_path = pathlib.Path(args.requirements)
+    results = pathlib.Path(args.results)
+    harness = pathlib.Path(args.harness)
     site, test_tmp = pathlib.Path(args.site), pathlib.Path(args.tmp)
     report = {"status":"RUNNING", "target":{}, "phases":[],
               "limitations":["Native x86-64 Linux container measurements are not NAS measurements.",
@@ -245,16 +265,19 @@ def main():
         mountinfo = pathlib.Path("/proc/self/mountinfo").read_text(encoding="ascii")
         phase = "secure_mount_preflight"
         validate_tmp_mount(test_tmp, mountinfo); validate_site_mount(site, mountinfo)
-        need(source.is_dir() and wheelhouse.is_dir() and results.is_dir() and requirements_path.is_file(), "INPUT_PATHS_INVALID")
-        for path in (source, wheelhouse, results, requirements_path):
-            need(not path.is_symlink(), "INPUT_SYMLINK_INVALID")
+        source = resolve_checked_input(source, "directory")
+        wheelhouse = resolve_checked_input(wheelhouse, "directory")
+        requirements_path = resolve_checked_input(requirements_path, "file")
+        results = resolve_checked_input(results, "directory")
+        harness = resolve_checked_input(harness, "directory")
 
         phase = "wheel_hash_preflight"
-        lock = pathlib.Path(args.harness) / "native-linux-wheel-lock.json"
+        lock = harness / "native-linux-wheel-lock.json"
         requirements = requirements_from_lock(lock, wheelhouse)
         lockfile = requirements_path
         need(lockfile.read_text(encoding="ascii") == requirements, "REQUIREMENTS_LOCK_MISMATCH")
-        site.mkdir(mode=0o700)
+
+        phase = "fixture_preparation"
         fixture = test_tmp / "native-mcp-fixture"
         fixture.mkdir(mode=0o700)
         credentials = fixture / "users"
@@ -285,7 +308,7 @@ def main():
                     "MCP_ARMV7_FIXTURE_CREDS":str(credentials)})
         phase = "native_import_crypto_and_synthetic_ntlm"
         if run_measured("native_import_crypto_and_synthetic_ntlm",
-                [sys.executable,"-B",str(pathlib.Path(args.harness)/"native_linux_runtime_smoke.py")],
+                [sys.executable,"-B",str(harness/"native_linux_runtime_smoke.py")],
                 env,source,results/"native-runtime-smoke.log",report["phases"],cg):
             raise RuntimeError("NATIVE_RUNTIME_SMOKE_FAILED")
         phase = "native_mcp_gateway_supervisor_watchdog_cycle"
@@ -301,7 +324,8 @@ def main():
         code = 0
     except Exception as exc:
         reason = str(exc) if isinstance(exc, RuntimeError) and re.fullmatch(r"[A-Z0-9_]+", str(exc)) else "NATIVE_RUNNER_ERROR"
-        primary = {"phase":phase,"code":reason,"class":type(exc).__name__}
+        primary = {"phase":phase,"code":reason,"class":type(exc).__name__,
+                   "errno":getattr(exc, "errno", None) if isinstance(exc, OSError) else None}
         report.update({"status":"FAIL","failed_phase":phase,"primary_error":primary})
     finally:
         if fixture is not None:
@@ -315,10 +339,12 @@ def main():
             except Exception as exc:
                 report["fixture_cleanup"] = "INCOMPLETE"
                 report["fixture_cleanup_error_class"] = type(exc).__name__
+                report["fixture_cleanup_errno"] = getattr(exc, "errno", None) if isinstance(exc, OSError) else None
                 if primary is None:
                     report.update({"status":"FAIL","failed_phase":"fixture_cleanup",
                         "primary_error":{"phase":"fixture_cleanup","code":"FIXTURE_CLEANUP_FAILED",
-                                          "class":type(exc).__name__}})
+                                          "class":type(exc).__name__,
+                                          "errno":getattr(exc, "errno", None) if isinstance(exc, OSError) else None}})
                 code = 1
         try:
             residuals = sorted(item.name for item in test_tmp.iterdir())
@@ -332,6 +358,7 @@ def main():
         except Exception as exc:
             report["test_tmp_cleanup"] = "UNVERIFIED"
             report["test_tmp_cleanup_error_class"] = type(exc).__name__
+            report["test_tmp_cleanup_errno"] = getattr(exc, "errno", None) if isinstance(exc, OSError) else None
             report["status"] = "FAIL"; code = 1
         report["container_cgroup_memory_peak_bytes"] = read_int(cgroup_memory_paths()[1])
         report["harness_process_maxrss_kib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss

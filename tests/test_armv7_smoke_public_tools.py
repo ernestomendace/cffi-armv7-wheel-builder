@@ -40,6 +40,124 @@ def load_native_script(name):
 NATIVE_PREP = load_native_script("prepare_native_inputs.py")
 NATIVE_RUNNER = load_native_script("native_linux_runner.py")
 
+class NativeLinuxRunnerPreflightTests(unittest.TestCase):
+    def _invoke_main(self, mutation=None, mount_failure=None, fake_uid=False,
+                     install_error=None, fixture_error=False):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp).resolve()
+            paths = {name:root/name for name in
+                     ("source", "wheelhouse", "results", "harness", "test-tmp", "site")}
+            for name in ("source", "wheelhouse", "results", "harness", "test-tmp", "site"):
+                paths[name].mkdir(mode=0o700)
+            (paths["harness"] / "native-linux-wheel-lock.json").write_text("{}\n")
+            (root / "requirements.lock").write_text("locked\n")
+            if mutation:
+                mutation(paths, root)
+            tmp_mount = "1 0 0:1 / %s rw - tmpfs tmpfs rw,noexec,nosuid,nodev\n" % paths["test-tmp"]
+            site_mount = "2 0 0:2 / %s rw - tmpfs tmpfs rw,nosuid,nodev\n" % paths["site"]
+            mountinfo = tmp_mount + ("" if mount_failure == "missing-site-mount" else site_mount)
+            if mount_failure == "site-mount-options":
+                mountinfo = tmp_mount + "2 0 0:2 / %s rw - tmpfs tmpfs rw,nodev\n" % paths["site"]
+            measured = []
+            def fake_measure(name, command, env, cwd, log_path, metrics, cg):
+                measured.append((name, command))
+                if install_error:
+                    raise install_error
+                return 1
+            original_read_text = pathlib.Path.read_text
+            def read_text(path, *args, **kwargs):
+                if str(path) == "/proc/self/mountinfo":
+                    return mountinfo
+                return original_read_text(path, *args, **kwargs)
+            argv = ["native_linux_runner.py", "--source", str(paths["source"]),
+                    "--wheelhouse", str(paths["wheelhouse"]), "--requirements", str(root/"requirements.lock"),
+                    "--results", str(paths["results"]), "--harness", str(paths["harness"]),
+                    "--site", str(paths["site"]), "--tmp", str(paths["test-tmp"])]
+            patches = [
+                mock.patch.object(NATIVE_RUNNER.sys, "platform", "linux"),
+                mock.patch.object(NATIVE_RUNNER.sys, "version_info", (3, 9, 25)),
+                mock.patch.object(NATIVE_RUNNER.platform, "machine", return_value="x86_64"),
+                mock.patch.object(NATIVE_RUNNER.sysconfig, "get_config_var", return_value="cpython-39-x86_64-linux-gnu"),
+                mock.patch.object(NATIVE_RUNNER, "struct_size_ok", return_value=True),
+                mock.patch.object(NATIVE_RUNNER, "requirements_from_lock", return_value="locked\n"),
+                mock.patch.object(NATIVE_RUNNER, "run_measured", side_effect=fake_measure),
+                mock.patch.object(NATIVE_RUNNER, "cgroup_memory_paths", return_value=(None,None,None)),
+                mock.patch.object(NATIVE_RUNNER.pathlib.Path, "read_text", new=read_text),
+                mock.patch.object(NATIVE_RUNNER.sys, "argv", argv),
+            ]
+            if fixture_error:
+                original_mkdir = pathlib.Path.mkdir
+                def mkdir(path, *args, **kwargs):
+                    if path == paths["test-tmp"] / "native-mcp-fixture":
+                        raise OSError(28, "fixture storage full")
+                    return original_mkdir(path, *args, **kwargs)
+                patches.append(mock.patch.object(NATIVE_RUNNER.pathlib.Path, "mkdir", new=mkdir))
+            if fake_uid:
+                patches.append(mock.patch.object(NATIVE_RUNNER.os, "getuid", return_value=os.getuid()+1))
+            with contextlib.ExitStack() as stack:
+                for patcher in patches: stack.enter_context(patcher)
+                code = NATIVE_RUNNER.main()
+            report = json.loads((paths["results"] / "native-runtime-report.json").read_text())
+            return code, report, measured, paths
+
+    def test_full_main_preflight_reaches_offline_install_call_with_existing_tmpfs(self):
+        code, report, measured, paths = self._invoke_main()
+        self.assertEqual(code, 1)  # the fixture makes only the attempted install fail
+        self.assertEqual([row[0] for row in measured], ["offline_wheel_install"])
+        self.assertIn("--no-index", measured[0][1])
+        self.assertEqual(report["failed_phase"], "offline_wheel_install")
+        self.assertEqual(report["fixture_cleanup"], "PASS")
+        self.assertEqual(report["test_tmp_cleanup"], "PASS")
+
+    def test_oserror_errno_and_fixture_phase_are_reported_separately(self):
+        code, report, measured, _paths = self._invoke_main(
+            install_error=PermissionError(13, "fixture install permission denied"))
+        self.assertEqual(code, 1)
+        self.assertEqual(report["primary_error"]["phase"], "offline_wheel_install")
+        self.assertEqual(report["primary_error"]["errno"], 13)
+        self.assertEqual(report["primary_error"]["class"], "PermissionError")
+        self.assertEqual(len(measured), 1)
+        code, report, measured, _paths = self._invoke_main(fixture_error=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(report["primary_error"]["phase"], "fixture_preparation")
+        self.assertEqual(report["primary_error"]["errno"], 28)
+        self.assertEqual(measured, [])
+
+    def test_full_main_preflight_rejects_mount_and_path_failures_before_install(self):
+        cases = [
+            ("missing-site-mount", None, None, "SITE_NOT_DEDICATED_TMPFS"),
+            ("site-mount-options", None, None, "SITE_MOUNT_OPTIONS_INVALID"),
+            (None, lambda p,r:(p["site"] / "unexpected").write_text("x"), None, "SITE_MOUNT_NOT_EMPTY"),
+            (None, lambda p,r:p["site"].chmod(0o755), None, "SITE_MOUNT_IDENTITY_INVALID"),
+            (None, lambda p,r:(p["site"].rmdir(), (r/"outside-site").mkdir(),
+                                p["site"].symlink_to(r/"outside-site")), None,
+             "SITE_MOUNT_INVALID"),
+            (None, lambda p,r:(p["source"].rmdir(), (r/"outside-source").mkdir(),
+                                p["source"].symlink_to(r/"outside-source")), None,
+             "INPUT_SYMLINK_INVALID"),
+            (None, None, True, "TEST_TMP_IDENTITY_INVALID"),
+        ]
+        for mount_failure, mutation, fake_uid, expected in cases:
+            with self.subTest(expected=expected):
+                code, report, measured, _paths = self._invoke_main(mutation, mount_failure, fake_uid)
+                self.assertEqual(code, 1)
+                self.assertEqual(measured, [])
+                self.assertEqual(report["primary_error"]["code"], expected)
+
+    def test_original_input_symlink_is_rejected_before_resolution(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp).resolve()
+            real = root / "real"; real.mkdir()
+            link = root / "link"; link.symlink_to(real)
+            with self.assertRaisesRegex(RuntimeError, "INPUT_SYMLINK_INVALID"):
+                NATIVE_RUNNER.resolve_checked_input(link, "directory")
+
+    def test_tree_pss_is_unavailable_when_any_process_value_is_missing(self):
+        self.assertEqual(NATIVE_RUNNER.tree_memory(10, {10:(1,100,80), 11:(10,50,None)}),
+                         (150,None,2))
+        self.assertEqual(NATIVE_RUNNER.tree_memory(10, {10:(1,100,80), 11:(10,50,30)}),
+                         (150,110,2))
+
 class Armv7SmokePublicToolTests(unittest.TestCase):
     def test_native_linux_lock_is_separate_and_pins_six_x86_64_distributions(self):
         lock_path = ROOT / "native-linux-smoke" / "native-linux-wheel-lock.json"
