@@ -103,12 +103,13 @@ docker run --rm --platform linux/arm/v7 --network none --read-only \
   --memory=4096m --memory-swap=4096m \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m \
   --tmpfs "/opt/mcp-armv7-site:rw,nosuid,nodev,exec,size=256m,uid=$RUN_UID,gid=$RUN_GID,mode=0700" \
+  --tmpfs "/mcp-armv7-test-tmp:rw,nosuid,nodev,noexec,size=128m,uid=$RUN_UID,gid=$RUN_GID,mode=0700" \
   --volume "$RUN_ROOT/private-source:/private-source:ro" \
   --volume "$RUN_ROOT/wheelhouse:/wheelhouse:ro" \
   --volume "$RUN_ROOT/requirements.lock:/requirements.lock:ro" \
   --volume "$ROOT/armv7-smoke:/smoke:ro" \
   --volume "$RESULTS:/results:rw" --workdir /private-source \
-  --env PYTHONDONTWRITEBYTECODE=1 "$IMAGE" \
+  --env PYTHONDONTWRITEBYTECODE=1 --env TMPDIR=/mcp-armv7-test-tmp "$IMAGE" \
   /opt/python/cp39-cp39/bin/python3.9 -B /smoke/container_runner.py \
   --wheelhouse /wheelhouse --source /private-source --smoke /smoke --results /results --lock /requirements.lock \
   >"$RESULTS/container.log" 2>&1

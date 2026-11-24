@@ -152,6 +152,27 @@ class Armv7SmokePublicToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ARMV7_SITE_MOUNT_INVALID"):
                 RUNNER.validate_site_mount(link)
 
+    def test_test_temp_mount_requires_private_dedicated_nonexec_tmpfs(self):
+        mountinfo = ("42 1 0:55 / /mcp-armv7-test-tmp rw,nosuid,nodev,noexec - "
+                     "tmpfs tmpfs rw,nosuid,nodev,noexec,size=128m")
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "private-tmp"
+            path.mkdir(mode=0o700)
+            path.chmod(0o700)
+            RUNNER.validate_test_tmp_mount(path, mountinfo.replace(
+                "/mcp-armv7-test-tmp", str(path)))
+            with self.assertRaisesRegex(RuntimeError, "ARMV7_TEST_TMP_MOUNT_OPTIONS_INVALID"):
+                RUNNER.validate_test_tmp_mount(
+                    path, mountinfo.replace("noexec", "exec").replace(
+                        "/mcp-armv7-test-tmp", str(path)))
+            with self.assertRaisesRegex(RuntimeError, "ARMV7_TEST_TMP_NOT_DEDICATED_TMPFS"):
+                RUNNER.validate_test_tmp_mount(
+                    path, mountinfo.replace("/mcp-armv7-test-tmp", "/tmp"))
+            (path / "unexpected").touch()
+            with self.assertRaisesRegex(RuntimeError, "ARMV7_TEST_TMP_NOT_EMPTY"):
+                RUNNER.validate_test_tmp_mount(
+                    path, mountinfo.replace("/mcp-armv7-test-tmp", str(path)))
+
     def test_prepare_lock_generation_mount_and_pip_argument_match(self):
         lock_data = json.loads((ROOT / "armv7-smoke" / "wheel-lock.json").read_text(encoding="utf-8"))
         lines = PREP.requirements_lock_lines(lock_data)
@@ -226,7 +247,7 @@ class Armv7SmokePublicToolTests(unittest.TestCase):
                                     os.environ.copy(), root, root / "missing" / "phase.log", [])
             self.assertFalse(marker.exists())
 
-    def test_container_launcher_uses_host_uid_and_dedicated_exec_tmpfs(self):
+    def test_container_launcher_uses_separate_private_test_tmpfs(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
             run_root = root / "run"
@@ -274,6 +295,11 @@ class Armv7SmokePublicToolTests(unittest.TestCase):
             tmpfs_values = [args[i + 1] for i, value in enumerate(args[:-1]) if value == "--tmpfs"]
             self.assertIn("/tmp:rw,nosuid,nodev,noexec,size=256m", tmpfs_values)
             self.assertTrue(any(value.startswith("/opt/mcp-armv7-site:") and ",exec," in value and "mode=0700" in value for value in tmpfs_values))
+            self.assertTrue(any(value.startswith("/mcp-armv7-test-tmp:")
+                                and "noexec" in value and "nosuid" in value
+                                and "nodev" in value and "mode=0700" in value
+                                for value in tmpfs_values))
+            self.assertIn("TMPDIR=/mcp-armv7-test-tmp", args)
             self.assertIn(str(run_root.resolve() / "requirements.lock") + ":/requirements.lock:ro", args)
             self.assertEqual(args[args.index("--lock") + 1], "/requirements.lock")
             validated_lock = RUNNER.validate_lock_file(run_root / "requirements.lock")

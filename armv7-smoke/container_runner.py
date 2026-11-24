@@ -34,6 +34,47 @@ def validate_site_mount(path):
     if next(path.iterdir(), None) is not None:
         raise RuntimeError("ARMV7_SITE_MOUNT_NOT_EMPTY")
 
+def find_mountinfo_entry(mountinfo_text, expected_mountpoint):
+    """Return filesystem/options for one exact mountpoint, never a parent."""
+    expected = str(pathlib.Path(expected_mountpoint))
+    replacements = ((r"\040", " "), (r"\011", "\t"),
+                    (r"\012", "\n"), (r"\134", "\\"))
+    for line in mountinfo_text.splitlines():
+        halves = line.split(" - ", 1)
+        if len(halves) != 2:
+            continue
+        left, right = halves
+        fields = left.split()
+        after = right.split()
+        if len(fields) < 6 or len(after) < 3:
+            continue
+        mountpoint = fields[4]
+        for encoded, decoded in replacements:
+            mountpoint = mountpoint.replace(encoded, decoded)
+        if mountpoint == expected:
+            options = set(fields[5].split(",")) | set(after[2].split(","))
+            return after[0], options
+    return None
+
+def validate_test_tmp_mount(path, mountinfo_text=None):
+    """Require an empty private tmpfs dedicated to non-executable test data."""
+    path = pathlib.Path(path)
+    if path.is_symlink() or not path.is_dir():
+        raise RuntimeError("ARMV7_TEST_TMP_INVALID")
+    info = os.lstat(str(path))
+    if (info.st_uid != os.geteuid() or info.st_gid != os.getegid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise RuntimeError("ARMV7_TEST_TMP_IDENTITY_INVALID")
+    if mountinfo_text is None:
+        mountinfo_text = pathlib.Path("/proc/self/mountinfo").read_text(encoding="ascii")
+    entry = find_mountinfo_entry(mountinfo_text, path)
+    if entry is None or entry[0] != "tmpfs":
+        raise RuntimeError("ARMV7_TEST_TMP_NOT_DEDICATED_TMPFS")
+    if not {"noexec", "nosuid", "nodev"}.issubset(entry[1]):
+        raise RuntimeError("ARMV7_TEST_TMP_MOUNT_OPTIONS_INVALID")
+    if next(path.iterdir(), None) is not None:
+        raise RuntimeError("ARMV7_TEST_TMP_NOT_EMPTY")
+
 def validate_lock_file(path):
     path = pathlib.Path(path)
     if path.is_symlink() or not path.is_file():
@@ -255,6 +296,7 @@ def main():
     exit_code = 1
     current_phase = "argument_path_preflight"
     fixture = None
+    test_tmp = None
     primary_recorded = False
     try:
         path_args = (args.wheelhouse, args.source, args.smoke, args.results)
@@ -282,9 +324,13 @@ def main():
         site = pathlib.Path("/opt/mcp-armv7-site")
         current_phase = "site_mount_preflight"
         validate_site_mount(site)
+        test_tmp = pathlib.Path("/mcp-armv7-test-tmp")
+        current_phase = "test_tmp_mount_preflight"
+        validate_test_tmp_mount(test_tmp)
         env = os.environ.copy()
         env.update({"PIP_CONFIG_FILE": os.devnull, "PIP_NO_INDEX": "1",
-                    "PYTHONDONTWRITEBYTECODE": "1", "PIP_NO_CACHE_DIR": "1"})
+                    "PYTHONDONTWRITEBYTECODE": "1", "PIP_NO_CACHE_DIR": "1",
+                    "TMPDIR": str(test_tmp)})
         install = build_offline_install_command(sys.executable, site, wheels, lock_path)
         current_phase = "offline_install"
         install_code = run_measured("offline_install", install, env, source,
@@ -295,7 +341,7 @@ def main():
                                              "category": "CHILD_EXIT", "exit_code": install_code}})
             primary_recorded = True
         else:
-            fixture_path = pathlib.Path("/tmp/mcp-armv7-fixture")
+            fixture_path = test_tmp / "mcp-armv7-fixture"
             current_phase = "fixture_setup"
             fixture_path.mkdir(mode=0o700)
             fixture = fixture_path
@@ -348,17 +394,42 @@ def main():
             report.setdefault("fixture_cleanup", "NOT_CREATED")
         else:
             try:
+                fixture_info = os.lstat(str(fixture))
+                if (not stat.S_ISDIR(fixture_info.st_mode) or stat.S_ISLNK(fixture_info.st_mode)
+                        or fixture_info.st_uid != os.geteuid()
+                        or fixture_info.st_gid != os.getegid()
+                        or stat.S_IMODE(fixture_info.st_mode) != 0o700
+                        or pathlib.Path(fixture).parent != test_tmp):
+                    raise RuntimeError("FIXTURE_DIRECTORY_IDENTITY_INVALID")
                 shutil.rmtree(str(fixture))
                 report["fixture_cleanup"] = "PASS"
-            except OSError as exc:
+            except (OSError, RuntimeError) as exc:
                 report["fixture_cleanup"] = "INCOMPLETE"
-                report["fixture_cleanup_errno"] = exc.errno
-                sys.stderr.write("MCP_ARMV7_CLEANUP_FAILURE phase=fixture_cleanup code=FIXTURE_CLEANUP_FAILED errno=%s\n" % (exc.errno or 0))
+                report["fixture_cleanup_errno"] = getattr(exc, "errno", None)
+                sys.stderr.write("MCP_ARMV7_CLEANUP_FAILURE phase=fixture_cleanup code=FIXTURE_CLEANUP_FAILED errno=%s\n" % (getattr(exc, "errno", None) or 0))
                 if not primary_recorded:
                     report.update({"status": "FAIL", "failed_phase": "fixture_cleanup",
                                    "primary_error": {"phase": "fixture_cleanup",
                                                      "code": "FIXTURE_CLEANUP_FAILED",
-                                                     "category": "OS_ERROR", "errno": exc.errno}})
+                                                     "category": "CLEANUP_ERROR",
+                                                     "errno": getattr(exc, "errno", None)}})
+                    primary_recorded = True
+                exit_code = 1
+        if test_tmp is not None:
+            try:
+                leftovers = sorted(item.name for item in test_tmp.iterdir())
+            except OSError as exc:
+                leftovers = ["UNREADABLE"]
+                report["test_tmp_cleanup_errno"] = exc.errno
+            report["test_tmp_cleanup"] = "PASS" if not leftovers else "INCOMPLETE"
+            if leftovers:
+                report["test_tmp_residual_names"] = leftovers[:16]
+                sys.stderr.write("MCP_ARMV7_CLEANUP_FAILURE phase=test_tmp_cleanup code=TEST_TMP_NOT_EMPTY errno=0\n")
+                if not primary_recorded:
+                    report.update({"status": "FAIL", "failed_phase": "test_tmp_cleanup",
+                                   "primary_error": {"phase": "test_tmp_cleanup",
+                                                     "code": "TEST_TMP_NOT_EMPTY",
+                                                     "category": "CLEANUP_ERROR"}})
                     primary_recorded = True
                 exit_code = 1
         primary = report.get("primary_error")
