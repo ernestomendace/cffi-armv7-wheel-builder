@@ -172,6 +172,29 @@ def _recover_cffi_wheel(lock, destination):
     (destination / wheel_entry).write_bytes(wheel_bytes)
 
 
+def requirements_lock_lines(lock):
+    """Build the six exact hash-pinned requirements from the public lock."""
+    entries = [lock["cffi_audit_source"]] + lock["wheels"]
+    if len(entries) != 6:
+        raise InputError("WHEEL_LOCK_INVENTORY_INVALID")
+    lines = []
+    seen = set()
+    for entry in entries:
+        if "wheel" in entry:
+            name, version, digest = "cffi", "2.0.0", entry["wheel_sha256"]
+        else:
+            name, version, digest = entry["name"], entry["version"], entry["sha256"]
+        normalized = re.sub(r"[-_.]+", "-", name).lower()
+        if normalized in seen or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise InputError("WHEEL_LOCK_ENTRY_INVALID")
+        seen.add(normalized)
+        lines.append("%s==%s --hash=sha256:%s" % (name, version, digest))
+    expected = {"cffi", "cryptography", "pycparser", "pyspnego", "smbprotocol", "typing-extensions"}
+    if seen != expected:
+        raise InputError("WHEEL_LOCK_INVENTORY_INVALID")
+    return lines
+
+
 def prepare(root, lock_path):
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
     results = root / "results"
@@ -188,14 +211,8 @@ def prepare(root, lock_path):
     for wheel in lock["wheels"]:
         _download_pypi_wheel(wheel, wheelhouse)
     _recover_cffi_wheel(lock, wheelhouse)
-    lines = []
-    for entry in [lock["cffi_audit_source"]] + lock["wheels"]:
-        if "wheel" in entry:
-            name, version, digest = entry["wheel"], "2.0.0", entry["wheel_sha256"]
-        else:
-            name, version, digest = entry["filename"], entry["version"], entry["sha256"]
-        lines.append("%s==%s --hash=sha256:%s" % (entry.get("name", "cffi"), version, digest))
-    (root / "requirements.lock").write_text("\n".join(lines) + "\n", encoding="ascii")
+    (root / "requirements.lock").write_text(
+        "\n".join(requirements_lock_lines(lock)) + "\n", encoding="ascii")
     (results / "prepare-status.json").write_text(
         json.dumps({"status": "PASS", "wheel_count": 6, "private_source_file_count": 46},
                    sort_keys=True) + "\n", encoding="ascii")
