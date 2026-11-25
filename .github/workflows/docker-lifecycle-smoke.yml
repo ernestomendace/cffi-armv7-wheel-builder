@@ -63,6 +63,7 @@ jobs:
           MCP_DOCKER_SOURCE_ARCHIVE: ${{ runner.temp }}/docker-trial-inputs/application-source.tar.gz
           MCP_DOCKER_SOURCE_SHA256: dbabd3815b789483a0446cb2db16a9ff82d9bbff3ee4beb355254783f8de728f
           DOCKER_TRIAL_RESULTS: ${{ runner.temp }}/docker-trial-results
+          PYTHONDONTWRITEBYTECODE: "1"
         run: |
           set -euo pipefail
           sudo -E python3 docker-lifecycle-smoke/docker_lifecycle_runner.py \
@@ -109,7 +110,10 @@ jobs:
         run: |
           set -euo pipefail
           for TARGET in "$RUNNER_TEMP/docker-trial-inputs" "$RUNNER_TEMP/docker-trial-results"; do
-            case "$TARGET" in "$RUNNER_TEMP"|/|"") exit 1 ;; esac
+            case "$TARGET" in
+              "$RUNNER_TEMP/docker-trial-inputs"|"$RUNNER_TEMP/docker-trial-results") ;;
+              *) exit 1 ;;
+            esac
             [[ ! -L "$TARGET" ]] || exit 1
-            if [[ -e "$TARGET" ]]; then rm -rf -- "$TARGET"; fi
+            if [[ -e "$TARGET" ]]; then sudo rm -rf -- "$TARGET"; fi
           done
