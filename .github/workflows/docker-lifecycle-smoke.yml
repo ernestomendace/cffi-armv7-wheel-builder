@@ -14,6 +14,9 @@ jobs:
   trial:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    env:
+      DOCKER_HOST: unix:///var/run/docker.sock
+      DOCKER_CONTEXT: ""
     steps:
       - name: Checkout public harness only
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -23,6 +26,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -m 700 "$RUNNER_TEMP/docker-trial-results"
+
+      - name: Test fail-closed Engine preflight helpers
+        shell: bash
+        run: python3 -B -m unittest discover -s docker-lifecycle-smoke -p 'test_*.py'
 
       - name: Recover private source and hash-locked wheels
         id: prepare
@@ -35,7 +42,7 @@ jobs:
           SOURCE_PART_04: ${{ secrets.MCP_DOCKER_TRIAL_SOURCE_B64_04 }}
         run: |
           set -euo pipefail
-          python3 docker-lifecycle-smoke/prepare_docker_inputs.py \
+          python3 -B docker-lifecycle-smoke/prepare_docker_inputs.py \
             --root "$RUNNER_TEMP/docker-trial-inputs"
 
       - name: Build unprivileged private test image by base digest
@@ -50,7 +57,8 @@ jobs:
           docker build --pull --network=none --iidfile "$IID" \
             --build-arg 'PYTHON_BASE=python:3.9.25-slim-bookworm@sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363' \
             --build-arg 'PYTHON_BASE_DIGEST=sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363' \
-            --tag codex-mcp-private-trial:local \
+            --label "codex.mcp.trial-image-run=$GITHUB_RUN_ID" \
+            --tag "codex-mcp-private-trial:$GITHUB_RUN_ID" \
             --file "$ROOT/tools/Dockerfile.ex4100-trial" "$ROOT"
           test -s "$IID"
 
@@ -61,16 +69,52 @@ jobs:
         shell: bash
         env:
           MCP_DOCKER_SOURCE_ARCHIVE: ${{ runner.temp }}/docker-trial-inputs/application-source.tar.gz
-          MCP_DOCKER_SOURCE_SHA256: dbabd3815b789483a0446cb2db16a9ff82d9bbff3ee4beb355254783f8de728f
+          MCP_DOCKER_SOURCE_SHA256: c6e5c90d1aeee613a8d6f2500f923136b2ffb063a1ba3599eb88e4dd302963ec
           DOCKER_TRIAL_RESULTS: ${{ runner.temp }}/docker-trial-results
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           set -euo pipefail
-          sudo -E python3 docker-lifecycle-smoke/docker_lifecycle_runner.py \
+          sudo -E python3 -B docker-lifecycle-smoke/docker_lifecycle_runner.py \
             --source "$RUNNER_TEMP/docker-trial-inputs/source/application" \
             --dependencies "$RUNNER_TEMP/docker-trial-inputs/dependency-bundle.tar.gz" \
             --dependency-sha256 "$(sha256sum "$RUNNER_TEMP/docker-trial-inputs/dependency-bundle.tar.gz" | cut -d' ' -f1)" \
             --image-iid "$RUNNER_TEMP/docker-trial-inputs/image.iid"
+
+      - name: Remove only the image built for this run
+        id: image_cleanup
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          IID_FILE="$RUNNER_TEMP/docker-trial-inputs/image.iid"
+          REPORT="$RUNNER_TEMP/docker-trial-results/image-cleanup.json"
+          mkdir -p -m 700 "$RUNNER_TEMP/docker-trial-results"
+          if [[ ! -s "$IID_FILE" ]]; then
+            printf '{"status":"NOT_BUILT"}\n' > "$REPORT"
+            chmod 600 "$REPORT"
+            exit 0
+          fi
+          IMAGE_ID="$(<"$IID_FILE")"
+          if [[ ! "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '{"status":"FAIL","code":"IMAGE_ID_INVALID"}\n' > "$REPORT"
+            chmod 600 "$REPORT"
+            exit 1
+          fi
+          INSPECT="$(docker image inspect --format '{{.Id}} {{index .Config.Labels "codex.mcp.trial-image-run"}}' "$IMAGE_ID" 2>/dev/null || true)"
+          if [[ "$INSPECT" != "$IMAGE_ID $GITHUB_RUN_ID" ]]; then
+            printf '{"status":"FAIL","code":"IMAGE_IDENTITY_MISMATCH"}\n' > "$REPORT"
+            chmod 600 "$REPORT"
+            exit 1
+          fi
+          docker image rm --no-prune "$IMAGE_ID" >/dev/null
+          if docker image inspect "$IMAGE_ID" >/dev/null 2>&1; then
+            printf '{"status":"FAIL","code":"IMAGE_REMOVE_READBACK_FAILED"}\n' > "$REPORT"
+            chmod 600 "$REPORT"
+            exit 1
+          fi
+          printf '{"status":"PASS","resource":"run-image"}\n' > "$REPORT"
+          chmod 600 "$REPORT"
 
       - name: Encrypt private diagnostics
         id: encrypt
@@ -81,12 +125,14 @@ jobs:
           MCP_DIAGNOSTIC_KEY_HEX: ${{ secrets.MCP_DOCKER_TRIAL_DIAGNOSTIC_KEY_HEX }}
         run: |
           set -euo pipefail
-          REPORT="$RUNNER_TEMP/docker-trial-results/docker-trial-report.json"
-          if [[ -f "$REPORT" ]]; then
-            sudo chown "$(id -u):$(id -g)" "$REPORT"
-            chmod 600 "$REPORT"
+          REPORT_DIR="$RUNNER_TEMP/docker-trial-results"
+          if [[ -d "$REPORT_DIR" && ! -L "$REPORT_DIR" ]]; then
+            sudo chown -R "$(id -u):$(id -g)" "$REPORT_DIR"
+            chmod 700 "$REPORT_DIR"
+            find "$REPORT_DIR" -type d -exec chmod 700 {} +
+            find "$REPORT_DIR" -type f -exec chmod 600 {} +
           fi
-          python3 armv7-smoke/encrypt_report.py --root "$RUNNER_TEMP/docker-trial-results"
+          python3 -B armv7-smoke/encrypt_report.py --root "$REPORT_DIR"
 
       - name: Publish status only
         if: always()
@@ -95,12 +141,14 @@ jobs:
           PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
           IMAGE_OUTCOME: ${{ steps.image.outcome }}
           TRIAL_OUTCOME: ${{ steps.trial.outcome }}
+          IMAGE_CLEANUP_OUTCOME: ${{ steps.image_cleanup.outcome }}
           ENCRYPT_OUTCOME: ${{ steps.encrypt.outcome }}
         run: |
-          printf 'Input preparation: %s\nImage build: %s\nReal Docker/CAS trial: %s\nEncrypted diagnostics: %s\n' \
-            "$PREPARE_OUTCOME" "$IMAGE_OUTCOME" "$TRIAL_OUTCOME" "$ENCRYPT_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Input preparation: %s\nImage build: %s\nReal Docker/CAS trial: %s\nImage cleanup: %s\nEncrypted diagnostics: %s\n' \
+            "$PREPARE_OUTCOME" "$IMAGE_OUTCOME" "$TRIAL_OUTCOME" "$IMAGE_CLEANUP_OUTCOME" "$ENCRYPT_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
           if [[ "$PREPARE_OUTCOME" != success || "$IMAGE_OUTCOME" != success || \
-                "$TRIAL_OUTCOME" != success || "$ENCRYPT_OUTCOME" != success ]]; then
+                "$TRIAL_OUTCOME" != success || "$IMAGE_CLEANUP_OUTCOME" != success || \
+                "$ENCRYPT_OUTCOME" != success ]]; then
             exit 1
           fi
 
