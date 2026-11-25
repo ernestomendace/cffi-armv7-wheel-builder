@@ -13,13 +13,13 @@ import tarfile
 import urllib.parse
 import urllib.request
 
-SOURCE_SHA256 = "d3b286729d7b68b89ffa9d9dae51e04cc5df8d54508b08e4ca3d756863a0365a"
-SOURCE_BYTES = 119675
-SOURCE_FILES = 24
-PARTS = 4
+SOURCE_SHA256 = "b84585392c29fe7406df8a9b1907a23f63a04176bc313bfac014349f9a230a13"
+SOURCE_BYTES = 128097
+SOURCE_FILES = 27
+PARTS = 5
 MAX_PART = 40000
-MAX_SOURCE = 120000  # four 40,000-character Base64 Actions secrets
-MAX_EXPANDED = 600000
+MAX_SOURCE = 150000  # five 40,000-character Base64 Environment Secrets
+MAX_EXPANDED = 650000
 MAX_WHEEL = 20_000_000
 X86_MANIFEST_SHA256 = "720fa4432638f69c1876d9ccb6a89b0dff6f29b530113a0402563cfc7c964187"
 
@@ -87,8 +87,10 @@ def _extract(data, root, expected_files):
     if count != expected_files:
         raise InputError("SOURCE_FILE_COUNT_MISMATCH")
     for required in ("tools/Dockerfile.ex4100-trial",
-        "tools/docker_trial_container_entrypoint.py", "tools/document_nas_docker_lease_port.py",
-        "tools/document_nas_local_service_lease_v2.py", "src/mcp_document_oauth_entrypoint.py",
+        "tools/docker_trial_container_entrypoint.py", "tools/docker_trial_e2e_runtime.py",
+        "tools/docker_trial_oauth_fixture.pem", "tools/document_nas_docker_lease_port.py",
+        "tools/document_nas_local_service_lease_v2.py", "tools/docker_trial_recovery_coordinator.py",
+        "src/mcp_document_oauth_entrypoint.py",
         "src/mcp_synthetic_tunnel_probe.py", "config/mcp-oauth-runtime.example.json"):
         if not (root / "application" / required).is_file():
             raise InputError("SOURCE_REQUIRED_FILE_MISSING")
@@ -181,6 +183,7 @@ def prepare(root, docker_lock_path, wheel_lock_path, profile_path):
             or source_spec.get("archive_sha256") != SOURCE_SHA256
             or source_spec.get("archive_bytes") != SOURCE_BYTES
             or source_spec.get("segments") != PARTS
+            or source_spec.get("max_expanded_bytes") != MAX_EXPANDED
             or lock.get("base_image_digest") != "sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363"):
         raise InputError("DOCKER_TRIAL_LOCK_INVALID")
     data = _source_bytes(lock)

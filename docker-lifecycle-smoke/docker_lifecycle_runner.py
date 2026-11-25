@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run real Docker Engine phases A-C with the production CAS implementation."""
+"""Run real Docker Engine phases A-E with the production CAS implementation."""
 import argparse
 import dataclasses
 import hashlib
@@ -517,7 +517,8 @@ def _docker_cli_socket():
     return path
 
 
-def _preserve_cas_for_reconciliation(temp_root, result_dir, auxiliary_contexts=()):
+def _preserve_cas_for_reconciliation(temp_root, result_dir, auxiliary_contexts=(),
+                                    recovery_context=None):
     target = Path(result_dir) / "cas-recovery"
     target.mkdir(mode=0o700)
     os.chmod(target, 0o700)
@@ -565,7 +566,296 @@ def _preserve_cas_for_reconciliation(temp_root, result_dir, auxiliary_contexts=(
             raise TrialFailure("AUX_CAS_RECOVERY_SOURCE_INVALID")
         hashes["auxiliary_{}".format(index)] = copy_store(
             source, target / "auxiliary-{:02d}".format(index), create_directory=True)
+    recovery_context = recovery_context or {}
+    recovery_lease_dir = recovery_context.get("lease_dir")
+    if isinstance(recovery_lease_dir, str) and Path(recovery_lease_dir).is_dir():
+        hashes["coordinator_recovery"] = copy_store(Path(recovery_lease_dir),
+            target / "coordinator-recovery", create_directory=True)
     return hashes
+
+
+def _run_dead_controller_recovery(*, temp_root, source_root, engine, image_id,
+                                  source_digest, boot_id, recovery_context,
+                                  dependency_archive, dependency_sha,
+                                  source_archive):
+    """Kill one real coordinator child, then reconcile its pinned Docker volume."""
+    from tools.document_nas_local_service_lease_v2 import (
+        SecureLeaseV2Store, _kernel_boot_id,
+    )
+    from tools.document_nas_docker_named_volume_lifecycle import (
+        VolumeSpec, _container_belongs_to_creation, validate_volume_readback,
+    )
+
+    state_root = Path(temp_root) / "recovery-coordinator"
+    recovery_context.update({"status":"RUNNING", "state_root":str(state_root),
+        "lease_dir":str(state_root / "lease")})
+    state_root.mkdir(mode=0o700)
+    os.chmod(state_root, 0o700)
+    if state_root.is_symlink() or stat.S_IMODE(state_root.stat().st_mode) != 0o700:
+        raise TrialFailure("RECOVERY_STATE_ROOT_UNSAFE")
+    public_runner_dir = Path(__file__).resolve().parent
+    script = source_root / "tools" / "docker_trial_recovery_coordinator.py"
+    if not script.is_file():
+        raise TrialFailure("RECOVERY_COORDINATOR_ENTRYPOINT_MISSING")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join((str(source_root), str(public_runner_dir)))
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    command = [sys.executable, "-B", str(script), "--state-root", str(state_root),
+        "--socket", EXPECTED_ENGINE_SOCKET, "--image-id", image_id,
+        "--base-digest", BASE_DIGEST, "--source-sha256", source_digest,
+        "--dependency-sha256", dependency_sha,
+        "--source-archive", str(source_archive),
+        "--dependencies", str(dependency_archive)]
+    started = time.monotonic()
+    child = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        encoding="utf-8", errors="replace", env=env, close_fds=True)
+    spawned_identity = _parse_proc_identity(child.pid)
+    if spawned_identity is not None:
+        recovery_context.update({"controller_pid":child.pid,
+            "controller_start_ticks":spawned_identity.get("start_ticks"),
+            "status":"COORDINATOR_SPAWNED"})
+    try:
+        import select
+        ready_fd = child.stdout.fileno()
+        readable, _, _ = select.select([ready_fd], [], [], 35.0)
+        if not readable:
+            raise TrialFailure("RECOVERY_COORDINATOR_READY_TIMEOUT")
+        line = child.stdout.readline(8193)
+        if len(line) > 8192 or not line.endswith("\n"):
+            raise TrialFailure("RECOVERY_COORDINATOR_READY_FRAME_INVALID")
+        try:
+            ready = json.loads(line)
+        except ValueError as exc:
+            raise TrialFailure("RECOVERY_COORDINATOR_READY_JSON_INVALID") from exc
+        if not isinstance(ready, dict) or ready.get("status") != "READY":
+            raise TrialFailure("RECOVERY_COORDINATOR_SETUP_FAILED")
+        pid = ready.get("pid")
+        ticks = ready.get("start_ticks")
+        run_id = ready.get("run_id")
+        lease_dir = ready.get("lease_dir")
+        if (pid != child.pid or not isinstance(ticks, str)
+                or not re.fullmatch(r"[0-9]+", ticks)
+                or not isinstance(run_id, str) or not re.fullmatch(
+                    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", run_id)
+                or not isinstance(lease_dir, str)
+                or Path(lease_dir).parent != state_root):
+            raise TrialFailure("RECOVERY_COORDINATOR_IDENTITY_FRAME_INVALID")
+        recovery_context.update({"run_id":run_id, "lease_dir":lease_dir,
+            "socket_dir":ready.get("socket_dir"),
+            "volume_name":ready.get("volume_name"),
+            "gateway_id":ready.get("gateway_id"),
+            "tunnel_id":ready.get("tunnel_id"),
+            "controller_pid":pid,
+            "controller_start_ticks":ticks, "status":"COORDINATOR_ACTIVE"})
+        observed_identity = _parse_proc_identity(pid)
+        if (observed_identity is None or observed_identity.get("start_ticks") != ticks
+                or observed_identity.get("uid_effective") != 0
+                or os.path.realpath(observed_identity.get("exe_path", ""))
+                    != os.path.realpath(sys.executable)):
+            raise TrialFailure("RECOVERY_COORDINATOR_PROCESS_IDENTITY_UNVERIFIED")
+        if child.poll() is not None:
+            raise TrialFailure("RECOVERY_COORDINATOR_EXITED_BEFORE_TERMINATION")
+        before_signal = _parse_proc_identity(pid)
+        if (before_signal is None or before_signal.get("start_ticks") != ticks
+                or os.path.realpath(before_signal.get("exe_path", ""))
+                    != os.path.realpath(sys.executable)):
+            raise TrialFailure("RECOVERY_COORDINATOR_IDENTITY_CHANGED_BEFORE_SIGNAL")
+        child.send_signal(15)
+        try:
+            _, stderr_text = child.communicate(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            current_identity = _parse_proc_identity(pid)
+            if (current_identity is None or current_identity.get("start_ticks") != ticks
+                    or os.path.realpath(current_identity.get("exe_path", ""))
+                        != os.path.realpath(sys.executable)):
+                raise TrialFailure("RECOVERY_COORDINATOR_KILL_IDENTITY_UNVERIFIED")
+            child.kill()
+            _, stderr_text = child.communicate(timeout=3.0)
+        exited = child.returncode
+        if exited != -15:
+            raise TrialFailure("RECOVERY_COORDINATOR_TERMINATION_UNEXPECTED")
+        dead_identity = _parse_proc_identity(pid)
+        if dead_identity is not None:
+            raise TrialFailure("RECOVERY_COORDINATOR_STILL_VISIBLE_AFTER_REAP")
+
+        store = SecureLeaseV2Store(lease_dir, trusted_root=str(state_root),
+                                   owner_uid=0, owner_gid=0)
+        current = store.read()
+        if (_kernel_boot_id() != boot_id or ready.get("boot_id") != boot_id
+                or current.run_id != run_id or current.owner_pid != pid
+                or current.owner_start_ticks != ticks
+                or current.docker_resources is None):
+            raise TrialFailure("RECOVERY_CAS_CONTROLLER_BINDING_INVALID")
+        claimed = store.claim_docker_trial_reconciliation(current.sequence,
+            run_id=run_id, claimant_pid=os.getpid(),
+            claimant_start_ticks=_proc_ticks(os.getpid()), now=time.monotonic(),
+            current_boot_id=boot_id)
+        if claimed is not True:
+            raise TrialFailure("RECOVERY_CAS_CLAIM_FAILED")
+        current = store.read()
+        resources = current.docker_resources
+        creation = (resources.creations or {}).get("volume")
+        pin = (resources.pins or {}).get("volume")
+        volume = VolumeSpec.for_run(run_id)
+        actual = engine.inspect_volume(volume.name)
+        expected_pin = {"role":"volume", "resource_id":volume.name,
+            "image_id":"", "name":volume.name, "run_id":run_id,
+            "volume_name":volume.name, "driver":"local",
+            "labels":dict(volume.labels), "network_mode":""}
+        if (current.phase != "UNCERTAIN" or resources.state != "STOPPING"
+                or creation is None or creation.get("state") != "VERIFIED"
+                or creation.get("resource_id") != volume.name
+                or creation.get("name") != volume.name
+                or creation.get("run_id") != run_id
+                or creation.get("labels") != dict(volume.labels)
+                or pin != expected_pin or not isinstance(actual, dict)
+                or not validate_volume_readback(volume, actual)
+                or set(resources.pins or {}) != {"volume", "gateway", "tunnel"}
+                or set(resources.creations or {}) != {"volume", "gateway", "tunnel"}):
+            raise TrialFailure("RECOVERY_VOLUME_OWNERSHIP_UNVERIFIED")
+        mountpoint = actual.get("Mountpoint")
+        if not isinstance(mountpoint, str) or not mountpoint.startswith("/"):
+            raise TrialFailure("RECOVERY_VOLUME_MOUNTPOINT_INVALID")
+        recovery_context["cas_claim"] = "PASS"
+        recovery_context["volume_mountpoint_readback"] = "PASS"
+        for role in ("tunnel", "gateway"):
+            role_pin = dict((resources.pins or {}).get(role, {}))
+            role_creation = dict((resources.creations or {}).get(role, {}))
+            expected_id = ready.get(role + "_id")
+            expected_name = ready.get(role + "_name")
+            if (role_pin.get("resource_id") != expected_id
+                    or role_creation.get("resource_id") != expected_id
+                    or role_creation.get("state") != "VERIFIED"
+                    or role_creation.get("name") != expected_name
+                    or role_creation.get("run_id") != run_id
+                    or role_pin.get("run_id") != run_id
+                    or role_pin.get("image_id") != image_id):
+                raise TrialFailure("RECOVERY_CONTAINER_CAS_IDENTITY_INVALID")
+            observed_container = engine.inspect_container(expected_id)
+            evidence = engine.inspect_image(image_id)
+            if (not isinstance(observed_container, dict)
+                    or observed_container.get("Id") != expected_id
+                    or not _container_belongs_to_creation(role_creation,
+                        observed_container, image_labels=evidence.config_labels,
+                        expected_base_digest=BASE_DIGEST)):
+                raise TrialFailure("RECOVERY_CONTAINER_OWNERSHIP_UNVERIFIED")
+            engine.collect_container_diagnostics(expected_id, run_id=run_id,
+                role=role, expected_name=expected_name, image_id=image_id)
+            state = observed_container.get("State", {}).get("Status")
+            if state == "running" and engine.stop_container(expected_id, 5) is not True:
+                raise TrialFailure("RECOVERY_CONTAINER_STOP_FAILED")
+            stopped = engine.inspect_container(expected_id)
+            stopped_state = stopped.get("State", {}).get("Status") if isinstance(stopped, dict) else None
+            if stopped_state not in {"created", "exited", "dead"}:
+                raise TrialFailure("RECOVERY_CONTAINER_STOP_READBACK_FAILED")
+            engine.remove_container(expected_id)
+            if (engine.inspect_container(expected_id) is not None
+                    or engine.inspect_container_name(expected_name) is not None):
+                raise TrialFailure("RECOVERY_CONTAINER_ABSENCE_UNVERIFIED")
+            current = store.read()
+            if store.docker_trial_recovery_cas(current.sequence, run_id=run_id,
+                    claimant_pid=os.getpid(), claimant_start_ticks=_proc_ticks(os.getpid()),
+                    now=time.monotonic(), clear_role=role, verified_absent=True) is not True:
+                raise TrialFailure("RECOVERY_CONTAINER_CAS_CLEAR_FAILED")
+            recovery_context["{}_recovery".format(role)] = {
+                "status":"PASS", "container_absent":True,
+                "exit_code":stopped.get("State", {}).get("ExitCode") if isinstance(stopped, dict) else None}
+        if engine.remove_volume(volume.name) is not True:
+            raise TrialFailure("RECOVERY_VOLUME_REMOVE_FAILED")
+        if engine.inspect_volume(volume.name) is not None:
+            raise TrialFailure("RECOVERY_VOLUME_ABSENCE_UNVERIFIED")
+        current = store.read()
+        if store.docker_trial_recovery_cas(current.sequence, run_id=run_id,
+                claimant_pid=os.getpid(), claimant_start_ticks=_proc_ticks(os.getpid()),
+                now=time.monotonic(), clear_role="volume", verified_absent=True) is not True:
+            raise TrialFailure("RECOVERY_VOLUME_CAS_CLEAR_FAILED")
+        current = store.read()
+        if store.docker_trial_recovery_cas(current.sequence, run_id=run_id,
+                claimant_pid=os.getpid(), claimant_start_ticks=_proc_ticks(os.getpid()),
+                now=time.monotonic(), state="STOPPED") is not True:
+            raise TrialFailure("RECOVERY_CAS_STOPPED_FAILED")
+        final = store.read()
+        final_resources = final.docker_resources
+        if (engine.inspect_volume(volume.name) is not None or final.phase != "UNCERTAIN"
+                or final_resources is None or final_resources.state != "STOPPED"
+                or final_resources.pins or final_resources.creations
+                or final_resources.intent is None):
+            raise TrialFailure("RECOVERY_FINAL_RECONCILIATION_FAILED")
+        recovery_context["volume_absent"] = True
+        socket_dir_text = ready.get("socket_dir")
+        socket_dir = Path(socket_dir_text) if isinstance(socket_dir_text, str) else None
+        if (socket_dir is None or socket_dir.parent != SOCKET_ROOT
+                or socket_dir.name != run_id.replace("-", "")):
+            raise TrialFailure("RECOVERY_SOCKET_DIRECTORY_IDENTITY_INVALID")
+        socket_path = socket_dir / "lease.sock"
+        if socket_path.is_symlink():
+            raise TrialFailure("RECOVERY_SOCKET_PATH_SYMLINK")
+        if socket_path.exists():
+            socket_stat = os.lstat(str(socket_path))
+            if not stat.S_ISSOCK(socket_stat.st_mode):
+                raise TrialFailure("RECOVERY_SOCKET_TYPE_MISMATCH")
+            socket_path.unlink()
+        socket_dir.rmdir()
+        recovery_context["socket_absent"] = True
+        # A historical intent remains audit data, but is not authority after
+        # STOPPED: both a stale coordinator port and recovery CAS are rejected.
+        from tools.document_nas_docker_lease_port import SecureDockerLeasePort
+        stale_port = SecureDockerLeasePort(store, run_id=run_id,
+            coordinator_pid=pid, coordinator_start_ticks=ticks,
+            monotonic=time.monotonic)
+        try:
+            stale_port.persist_intent(volume.name, image_id, image_id,
+                {"codex.mcp.trial":"1", "codex.mcp.run":run_id,
+                 "codex.mcp.role":"runtime"})
+            stale_intent_rejected = False
+        except Exception:
+            stale_intent_rejected = True
+        current = store.read()
+        try:
+            store.docker_trial_recovery_cas(current.sequence, run_id=run_id,
+                claimant_pid=os.getpid(), claimant_start_ticks=_proc_ticks(os.getpid()),
+                now=time.monotonic(), state="STOPPED")
+            terminal_reuse_rejected = False
+        except Exception:
+            terminal_reuse_rejected = True
+        if not stale_intent_rejected or not terminal_reuse_rejected:
+            raise TrialFailure("RECOVERY_HISTORIC_INTENT_REUSE_ACCEPTED")
+        result = {"status":"PASS", "run_id":run_id,
+            "coordinator_pid":pid, "coordinator_start_ticks":ticks,
+            "coordinator_exit_code":exited,
+            "termination_to_reap_seconds":round(time.monotonic() - started, 3),
+            "cas_claim":"PASS", "volume_pin_identity":"PASS",
+            "volume_absent":"PASS", "gateway_absent":"PASS", "tunnel_absent":"PASS",
+            "cas_terminal":"STOPPED",
+            "pins_empty":True, "creation_records_empty":True,
+            "historical_intent_retained":True,
+            "historical_intent_reuse_rejected":True,
+            "stderr_capture":"DISABLED_NO_SENSITIVE_DIAGNOSTICS",
+            "stderr_bytes":0}
+        recovery_context.update({"status":"PASS", "result":result,
+            "resource_absent":True, "cas_stopped":True})
+        return result
+    finally:
+        if child.poll() is None:
+            identity = _parse_proc_identity(child.pid)
+            if (identity is not None
+                    and identity.get("start_ticks") == recovery_context.get("controller_start_ticks")
+                    and os.path.realpath(identity.get("exe_path", "")) ==
+                        os.path.realpath(sys.executable)):
+                child.send_signal(15)
+            try:
+                child.communicate(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                identity = _parse_proc_identity(child.pid)
+                if (identity is not None and identity.get("start_ticks") ==
+                        recovery_context.get("controller_start_ticks")
+                        and os.path.realpath(identity.get("exe_path", "")) ==
+                            os.path.realpath(sys.executable)):
+                    child.kill()
+                child.communicate(timeout=3.0)
+        if recovery_context.get("status") != "PASS":
+            recovery_context["status"] = "UNCERTAIN"
 
 
 def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_id: str):
@@ -610,6 +900,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
     store = None
     port = None
     auxiliary_contexts = []
+    recovery_context = {"status":"NOT_STARTED"}
     image = image_id
     try:
         lease_dir = Path(temp_root) / "lease"
@@ -780,9 +1071,122 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         report["container_peer_auth"] = "PASS"
         report["application_cas_state"] = port.read_state(run_id)
         report["application_rpc_count"] = rpc.application_success_count
-        report["phases"]["D_full_runtime"] = "NOT_EXECUTED"
-        report["phases"]["E_deadline_recovery"] = "NOT_EXECUTED"
-        current_phase = "MAIN_A_B_C_CLEANUP"
+        report["phases"][current_phase] = "PASS"
+
+        current_phase = "D_gateway_tunnel_oauth_mcp_active_heartbeat"
+        report["phases"][current_phase] = "RUNNING"
+        gateway_before = engine.inspect_container(lifecycle.ids["gateway"])
+        gateway_logs_before = engine.collect_container_diagnostics(
+            lifecycle.ids["gateway"], run_id=run_id, role="gateway",
+            expected_name=lifecycle.specs["gateway"].name, image_id=image)
+        gateway_events_before = (gateway_logs_before.get("stdout_records", [])
+            + gateway_logs_before.get("stderr_records", []))
+        gateway_phases_before = [item.get("phase") for item in gateway_events_before
+            if isinstance(item, dict)]
+        report["gateway_residency_before_deadline"] = {
+            "container_running": bool(isinstance(gateway_before, dict)
+                and gateway_before.get("State", {}).get("Status") == "running"),
+            "entrypoint_observed":"gateway_entrypoint" in gateway_phases_before,
+            "resident_child_spawned":"resident_child_spawned" in gateway_phases_before,
+            "spontaneous_exit_observed":"resident_child_exit" in gateway_phases_before,
+            "diagnostic_status":gateway_logs_before.get("status"),
+            "exit_code":gateway_logs_before.get("exit_code"),
+            "events":gateway_events_before}
+        if (not report["gateway_residency_before_deadline"]["container_running"]
+                or not report["gateway_residency_before_deadline"]["entrypoint_observed"]
+                or not report["gateway_residency_before_deadline"]["resident_child_spawned"]
+                or report["gateway_residency_before_deadline"]["spontaneous_exit_observed"]):
+            raise TrialFailure("GATEWAY_RESIDENT_PROCESS_NOT_VERIFIED")
+
+        gateway_name = lifecycle.specs["gateway"].name
+        tunnel_name = lifecycle.specs["tunnel"].name
+        e2e_event = None
+        e2e_deadline = time.monotonic() + 35.0
+        while time.monotonic() < e2e_deadline:
+            tunnel_state = engine.inspect_container(lifecycle.ids["tunnel"])
+            gateway_state = engine.inspect_container(lifecycle.ids["gateway"])
+            if (not isinstance(tunnel_state, dict) or tunnel_state.get("State", {}).get("Status") != "running"):
+                raise TrialFailure("TUNNEL_EXITED_DURING_E2E")
+            if (not isinstance(gateway_state, dict) or gateway_state.get("State", {}).get("Status") != "running"):
+                raise TrialFailure("GATEWAY_EXITED_DURING_E2E")
+            tunnel_logs = engine.collect_container_diagnostics(lifecycle.ids["tunnel"],
+                run_id=run_id, role="tunnel", expected_name=tunnel_name, image_id=image)
+            records = (tunnel_logs.get("stdout_records", [])
+                       if tunnel_logs.get("status") == "PASS" else [])
+            e2e_event = next((item for item in records
+                if item.get("phase") in {"mcp_e2e_complete", "mcp_e2e_failed"}), None)
+            if e2e_event is not None:
+                break
+            time.sleep(0.5)
+        report["mcp_e2e_event"] = e2e_event or {"status":"NOT_OBSERVED"}
+        if not isinstance(e2e_event, dict) or e2e_event.get("phase") != "mcp_e2e_complete" \
+                or e2e_event.get("status") != "PASS":
+            raise TrialFailure("MCP_E2E_NOT_VERIFIED")
+        report["phases"]["D_http_health_oauth_rs256_pkce_mcp_readonly"] = "PASS"
+        lifecycle.commit_active(gateway_probe=True, tunnel_probe=True)
+        report["active_transition"] = "PASS"
+        heartbeat_before = rpc.application_operation_counts.get("heartbeat", 0)
+        memory_samples = []
+        heartbeat_deadline = time.monotonic() + 12.0
+        sample_started = time.monotonic()
+        while time.monotonic() < heartbeat_deadline:
+            row = {"elapsed_seconds":round(time.monotonic() - sample_started, 3)}
+            aggregate = 0
+            for role, cid, name in (("gateway", lifecycle.ids["gateway"], gateway_name),
+                                    ("tunnel", lifecycle.ids["tunnel"], tunnel_name)):
+                stats = engine.read_container_memory_stats(cid, run_id=run_id,
+                    role=role, expected_name=name, image_id=image)
+                row[role] = stats
+                aggregate += stats["usage_bytes"]
+            row["sampled_container_usage_sum_bytes"] = aggregate
+            memory_samples.append(row)
+            if rpc.application_operation_counts.get("heartbeat", 0) >= heartbeat_before + 2:
+                # Keep a full second post-heartbeat sample for the peak series.
+                if len(memory_samples) >= 2:
+                    break
+            time.sleep(0.75)
+        heartbeat_count = rpc.application_operation_counts.get("heartbeat", 0)
+        report["active_heartbeat"] = {"status":"PASS" if heartbeat_count >= heartbeat_before + 2 else "FAIL",
+            "heartbeat_count_before":heartbeat_before, "heartbeat_count_after":heartbeat_count,
+            "state_reads":rpc.application_operation_counts.get("read_state", 0)}
+        report["memory_measurement"] = {"source":"Docker Engine API 1.41 container cgroup stats",
+            "architecture":"x86_64 GitHub runner", "samples":memory_samples,
+            "sample_count":len(memory_samples),
+            "max_sampled_gateway_plus_tunnel_usage_bytes":max(
+                (item["sampled_container_usage_sum_bytes"] for item in memory_samples), default=None),
+            "includes_controller_or_daemon":False,
+            "interpretation":"container cgroup usage; not a NAS or whole-job measurement"}
+        if heartbeat_count < heartbeat_before + 2 or len(memory_samples) < 2:
+            raise TrialFailure("ACTIVE_HEARTBEAT_OR_MEMORY_SAMPLING_INCOMPLETE")
+        report["phases"][current_phase] = "PASS"
+        report["phases"]["D_full_runtime"] = "PASS"
+
+        current_phase = "E_deadline_ordinary_stop_and_expiry_guards"
+        report["phases"][current_phase] = "RUNNING"
+        deadline_started = time.monotonic()
+        lifecycle.deadline_stop(deadline_monotonic=deadline_started + 5.0)
+        report["deadline_stop"] = {"status":"PASS", "requested_seconds":5.0,
+            "elapsed_seconds":round(time.monotonic() - deadline_started, 3)}
+        post_expiry = {}
+        try:
+            post_expiry["heartbeat_rejected"] = port.heartbeat(run_id) is not True
+        except Exception as exc:
+            post_expiry["heartbeat_rejected"] = True
+            post_expiry["heartbeat_error"] = getattr(exc, "code", type(exc).__name__[:80])
+        try:
+            port.persist_intent(lifecycle.volume.name, image, image,
+                {"codex.mcp.trial":"1", "codex.mcp.run":run_id, "codex.mcp.role":"runtime"})
+            post_expiry["historic_intent_reuse_rejected"] = False
+        except Exception as exc:
+            post_expiry["historic_intent_reuse_rejected"] = True
+            post_expiry["historic_intent_error"] = getattr(exc, "code", type(exc).__name__[:80])
+        report["post_terminal_authorization"] = post_expiry
+        if any(post_expiry.get(key) is not True for key in
+               ("heartbeat_rejected", "historic_intent_reuse_rejected")):
+            raise TrialFailure("POST_TERMINAL_OPERATION_NOT_REJECTED")
+        report["phases"][current_phase] = "PASS"
+        report["phases"]["E_deadline_expiry_guards"] = "PASS"
+        current_phase = "MAIN_D_E_CLEANUP"
         report["phases"][current_phase] = "RUNNING"
         lifecycle.cleanup()
         main_final = store.read()
@@ -797,10 +1201,34 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             and port.read_installer_pin(run_id) is None
             and all(port.read_pin(run_id, role) is None for role in ("gateway", "tunnel")))
         if not main_cleanup_verified:
-            raise TrialFailure("MAIN_A_B_C_CLEANUP_UNVERIFIED")
+            raise TrialFailure("MAIN_D_E_CLEANUP_UNVERIFIED")
         lifecycle_cleanup_verified = True
-        report["main_a_b_c_cleanup"] = "PASS"
+        report["main_d_e_cleanup"] = "PASS"
         report["phases"][current_phase] = "PASS"
+        gateway_after = next((item for item in reversed(engine.container_diagnostics)
+            if item.get("role") == "gateway" and item.get("run_id") == run_id), None)
+        gateway_shutdown_events = ((gateway_after or {}).get("stdout_records", [])
+            + (gateway_after or {}).get("stderr_records", []))
+        gateway_shutdown_phases = [item.get("phase") for item in gateway_shutdown_events
+            if isinstance(item, dict)]
+        report["gateway_termination_classification"] = {
+            "exit_code":(gateway_after or {}).get("exit_code"),
+            "oom_killed":(gateway_after or {}).get("oom_killed"),
+            "shutdown_requested_before_cleanup":"shutdown_requested" in gateway_shutdown_phases,
+            "child_stopped_by_controller":"resident_child_stopped" in gateway_shutdown_phases,
+            "spontaneous_child_exit":"resident_child_exit" in gateway_shutdown_phases,
+            "diagnostic_status":(gateway_after or {}).get("status"),
+            "events":gateway_shutdown_events}
+
+        current_phase = "E_dead_controller_recovery_independent_lease"
+        report["phases"][current_phase] = "RUNNING"
+        report["coordinator_recovery"] = _run_dead_controller_recovery(
+            temp_root=temp_root, source_root=source_root, engine=engine,
+            image_id=image, source_digest=source_digest, boot_id=boot,
+            recovery_context=recovery_context, dependency_archive=dependency_archive,
+            dependency_sha=dependency_sha, source_archive=source_archive)
+        report["phases"][current_phase] = "PASS"
+        report["phases"]["E_deadline_recovery"] = "PASS"
 
         # The NoCopy=false control is supplemental and has its own independent CAS.
         # It runs only after A-C and their cleanup have been read back as complete.
@@ -827,7 +1255,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         if not nocopy_context["removed"]:
             raise TrialFailure("NOCOPY_AUXILIARY_CLEANUP_UNVERIFIED")
         if report["phases"].get(current_phase) == "PASS":
-            report["status"] = "PASS_A_B_C_NOCOPY_CONTROL"
+            report["status"] = "PASS_A_B_C_D_E_NOCOPY_CONTROL"
             return_code = 0
         else:
             report["status"] = "PARTIAL_A_B_C_NOCOPY_CONTROL_FAILED"
@@ -842,6 +1270,8 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         diagnostics = getattr(exc, "diagnostics", None)
         if isinstance(diagnostics, dict):
             details.update(diagnostics)
+        if recovery_context.get("status") not in {"NOT_STARTED", "PASS"}:
+            report["coordinator_recovery"] = recovery_context
         report["primary_error_diagnostics"] = details
         if engine is not None and engine.last_peer_diagnostic is not None:
             report["engine_peer_diagnostic"] = engine.last_peer_diagnostic
@@ -896,7 +1326,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             except Exception as exc:
                 report["rpc_shutdown"] = "FAIL"
                 report["rpc_shutdown_error"] = _safe_exception_details(exc, "rpc_shutdown")
-                if report.get("status") == "PASS_A_B_C":
+                if str(report.get("status", "")).startswith("PASS_"):
                     report["status"] = "FAIL_CLEANUP"
                     return_code = 1
             if rpc_thread_errors:
@@ -934,6 +1364,18 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
                     and (current is None or current.state == "STOPPED"))
             except Exception:
                 resources_absent = False
+        recovery_absent = recovery_context.get("status") in {"NOT_STARTED", "PASS"}
+        if recovery_context.get("status") == "PASS":
+            try:
+                recovery_absent = (engine is not None and recovery_context.get("volume_name")
+                    and engine.inspect_volume(recovery_context["volume_name"]) is None
+                    and recovery_context.get("resource_absent") is True
+                    and recovery_context.get("cas_stopped") is True)
+            except Exception:
+                recovery_absent = False
+        report["coordinator_recovery_reconciliation"] = (
+            "PASS" if recovery_absent else recovery_context.get("status", "UNCERTAIN"))
+        resources_absent = resources_absent and bool(recovery_absent)
         if engine is not None:
             for context in auxiliary_contexts:
                 try:
@@ -964,7 +1406,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             result_dir = Path(os.environ.get("DOCKER_TRIAL_RESULTS", "/results"))
             try:
                 report["cas_recovery_copy_sha256"] = _preserve_cas_for_reconciliation(
-                    temp_root, result_dir, auxiliary_contexts)
+                    temp_root, result_dir, auxiliary_contexts, recovery_context)
                 report["controller_state_cleanup"] = "RETAINED_FOR_RECONCILIATION"
                 report["controller_state_path"] = "encrypted-report:cas-recovery"
             except Exception as exc:
@@ -992,8 +1434,11 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
     for name in ("A_readback_failure_cleanup_regression", "IMAGE_SENTINEL_PREFLIGHT",
                  "A_volume_init_readback",
                  "B_offline_installer_import_cgroup",
-                 "C_same_store_so_peercred_peer_pin", "MAIN_A_B_C_CLEANUP",
-                 "POST_MAIN_NOCOPY_POSITIVE_CONTROL", "D_full_runtime", "E_deadline_recovery"):
+                 "C_same_store_so_peercred_peer_pin", "D_gateway_tunnel_oauth_mcp_active_heartbeat",
+                 "D_http_health_oauth_rs256_pkce_mcp_readonly", "E_deadline_ordinary_stop_and_expiry_guards",
+                 "E_deadline_expiry_guards", "E_dead_controller_recovery_independent_lease",
+                 "E_deadline_recovery", "MAIN_D_E_CLEANUP",
+                 "POST_MAIN_NOCOPY_POSITIVE_CONTROL"):
         print("DOCKER_TRIAL_{}={}".format(name, report.get("phases", {}).get(name, "NOT_REACHED")))
     return return_code
 

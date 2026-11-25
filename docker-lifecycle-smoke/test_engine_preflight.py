@@ -23,7 +23,7 @@ class DockerEnginePreflightTests(unittest.TestCase):
         self.assertIn("verify_image_permissions.py", workflow)
         self.assertIn("steps.image_permissions.outcome == 'success'", workflow)
         self.assertLess(workflow.index("Verify built image access for application UID"),
-                        workflow.index("Run phases A-C with real Docker Engine"))
+                        workflow.index("Run phases A-E with real Docker Engine"))
 
     def test_private_source_lock_matches_loader_and_runner_reaches_real_regression(self):
         root = Path(__file__).resolve().parent
@@ -34,6 +34,7 @@ class DockerEnginePreflightTests(unittest.TestCase):
         self.assertEqual(private["archive_sha256"], prepare_docker_inputs.SOURCE_SHA256)
         self.assertEqual(private["archive_bytes"], prepare_docker_inputs.SOURCE_BYTES)
         self.assertEqual(private["file_count"], prepare_docker_inputs.SOURCE_FILES)
+        self.assertEqual(private["max_expanded_bytes"], prepare_docker_inputs.MAX_EXPANDED)
         source = (root / "docker_lifecycle_runner.py").read_text(encoding="utf-8")
         self.assertIn("run_real_readback_cleanup_regression", source)
         self.assertIn("A_readback_failure_cleanup_regression", source)

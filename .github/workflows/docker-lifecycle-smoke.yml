@@ -42,6 +42,7 @@ jobs:
           SOURCE_PART_02: ${{ secrets.MCP_DOCKER_TRIAL_SOURCE_B64_02 }}
           SOURCE_PART_03: ${{ secrets.MCP_DOCKER_TRIAL_SOURCE_B64_03 }}
           SOURCE_PART_04: ${{ secrets.MCP_DOCKER_TRIAL_SOURCE_B64_04 }}
+          SOURCE_PART_05: ${{ secrets.MCP_DOCKER_TRIAL_SOURCE_B64_05 }}
         run: |
           set -euo pipefail
           python3 -B docker-lifecycle-smoke/prepare_docker_inputs.py \
@@ -62,6 +63,7 @@ jobs:
             python3 -B -m unittest \
             test_image_permissions \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_rpc_server_stops_before_socket_close_without_thread_exception \
+            test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_dead_controller_recovery_clears_creation_and_pin_atomically \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_actual_adapter_sentinel_command_passes_real_entrypoint_parser \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_docker_gateway_readback_normalizes_only_observed_engine_defaults \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_entrypoint_argparse_failure_is_structured \
@@ -99,7 +101,7 @@ jobs:
           python3 -B docker-lifecycle-smoke/verify_image_permissions.py \
             --iid-file "$RUNNER_TEMP/docker-trial-inputs/image.iid"
 
-      - name: Run phases A-C with real Docker Engine and SecureLeaseV2Store
+      - name: Run phases A-E with real Docker Engine and SecureLeaseV2Store
         id: trial
         if: steps.image.outcome == 'success' && steps.image_permissions.outcome == 'success'
         continue-on-error: true

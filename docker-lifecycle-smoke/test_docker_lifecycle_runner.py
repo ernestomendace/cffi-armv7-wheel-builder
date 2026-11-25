@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -24,6 +25,78 @@ if SOURCE_ROOT and os.path.isdir(SOURCE_ROOT):
 
 
 class RunnerDiagnosticsTests(unittest.TestCase):
+    def test_dead_controller_recovery_clears_creation_and_pin_atomically(self):
+        required = os.environ.get("DOCKER_TRIAL_REQUIRE_REAL_RPC_TEST") == "1"
+        if not os.path.isdir("/proc"):
+            if required:
+                self.fail("RECOVERY_CAS_REQUIRES_LINUX_PROCFS")
+            self.skipTest("same-boot process identity recovery requires Linux")
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if required:
+                self.fail("RECOVERY_CAS_PRIVATE_SOURCE_MISSING")
+            self.skipTest("private source archive is staged only in the Linux trial job")
+        try:
+            from tools.document_nas_local_service_lease_v2 import (
+                SecureLeaseV2Store, _kernel_boot_id, _proc_start_ticks,
+            )
+        except ImportError as exc:
+            if required:
+                self.fail("RECOVERY_CAS_PRIVATE_IMPORT_FAILED:" + type(exc).__name__)
+            self.skipTest("private CAS source not staged")
+        with tempfile.TemporaryDirectory(prefix="docker-recovery-cas-") as tmp:
+            root = Path(tmp)
+            os.chmod(root, 0o700)
+            child_script = root / "coordinator.py"
+            child_script.write_text("""import dataclasses, json, os, time, uuid
+from tools.document_nas_local_service_lease_v2 import LeaseRecord, SecureLeaseV2Store, _kernel_boot_id, _proc_start_ticks
+from tools.document_nas_docker_lease_port import SecureDockerLeasePort
+run_id=str(uuid.uuid4()); pid=os.getpid(); ticks=_proc_start_ticks(pid); boot=_kernel_boot_id(); now=time.monotonic()
+image='sha256:'+'a'*64; root=os.environ['RECOVERY_TEST_ROOT']; lease_dir=os.path.join(root,'lease')
+os.mkdir(lease_dir,0o700)
+record=LeaseRecord.initial(run_id=run_id,boot_id=boot,mode='trial',owner_role='coordinator',owner_pid=pid,owner_start_ticks=ticks,contract_digest='b'*64,now=now,phase_ttl=270.0,run_deadline_monotonic=now+280.0)
+record=dataclasses.replace(record,coordinator_pid=pid,coordinator_start_ticks=ticks)
+store=SecureLeaseV2Store(lease_dir,trusted_root=root,owner_uid=os.geteuid(),owner_gid=os.getegid()); store.create(record)
+port=SecureDockerLeasePort(store,run_id=run_id,coordinator_pid=pid,coordinator_start_ticks=ticks,monotonic=time.monotonic)
+name='codex-mcp-trial-'+run_id.replace('-',''); labels={'codex.mcp.trial':'1','codex.mcp.run':run_id,'codex.mcp.role':'runtime'}
+port.persist_intent(name,image,image,labels); port.begin_resource_creation(run_id,'volume',name=name,image_id='',volume_name=name,driver='local',labels=labels)
+port.record_created_resource(run_id,'volume',name); port.persist_volume_pin(run_id,name,'local',labels)
+""", encoding="utf-8")
+            env = dict(os.environ)
+            env["PYTHONPATH"] = SOURCE_ROOT
+            env["RECOVERY_TEST_ROOT"] = str(root)
+            child = subprocess.run([sys.executable, "-B", str(child_script)],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=15, check=False)
+            self.assertEqual(child.returncode, 0, child.stderr.decode("utf-8", "replace")[:500])
+            store = SecureLeaseV2Store(str(root / "lease"), trusted_root=str(root),
+                owner_uid=os.geteuid(), owner_gid=os.getegid())
+            record = store.read()
+            claimant_ticks = _proc_start_ticks(os.getpid())
+            self.assertTrue(store.claim_docker_trial_reconciliation(record.sequence,
+                run_id=record.run_id, claimant_pid=os.getpid(),
+                claimant_start_ticks=claimant_ticks, now=__import__("time").monotonic(),
+                current_boot_id=_kernel_boot_id()))
+            current = store.read()
+            self.assertEqual(current.docker_resources.state, "STOPPING")
+            self.assertEqual(set(current.docker_resources.pins), {"volume"})
+            self.assertEqual(set(current.docker_resources.creations), {"volume"})
+            self.assertTrue(store.docker_trial_recovery_cas(current.sequence,
+                run_id=record.run_id, claimant_pid=os.getpid(),
+                claimant_start_ticks=claimant_ticks, now=__import__("time").monotonic(),
+                clear_role="volume", verified_absent=True))
+            current = store.read()
+            self.assertFalse(current.docker_resources.pins)
+            self.assertFalse(current.docker_resources.creations)
+            self.assertIsNotNone(current.docker_resources.intent)
+            self.assertTrue(store.docker_trial_recovery_cas(current.sequence,
+                run_id=record.run_id, claimant_pid=os.getpid(),
+                claimant_start_ticks=claimant_ticks, now=__import__("time").monotonic(),
+                state="STOPPED"))
+            stopped = store.read()
+            self.assertEqual(stopped.docker_resources.state, "STOPPED")
+            self.assertFalse(stopped.docker_resources.pins)
+            self.assertFalse(stopped.docker_resources.creations)
+
     def test_docker_gateway_readback_normalizes_only_observed_engine_defaults(self):
         if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
             if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
@@ -58,6 +131,7 @@ class RunnerDiagnosticsTests(unittest.TestCase):
                     "docker_trial_container_entrypoint:synthetic_test_provider_factory"],
                 "Env":["PYTHONDONTWRITEBYTECODE=1","MCP_SYNTHETIC_TUNNEL=1",
                     "MCP_SYNTHETIC_CREDENTIALS=1",
+                    "MCP_DOCKER_TRIAL_FULL_RUNTIME=1",
                     "MCP_CAS_SOCKET_PATH=/run/codex-mcp-lease/lease.sock"]},
             "HostConfig":{"NetworkMode":"none","Privileged":False,"CapAdd":[],
                 "CapDrop":["ALL"],"ReadonlyRootfs":True,
@@ -85,6 +159,7 @@ class RunnerDiagnosticsTests(unittest.TestCase):
             "Entrypoint":observed["Config"]["Entrypoint"],"Cmd":observed["Config"]["Cmd"],
             "Env":["PYTHONDONTWRITEBYTECODE=1","MCP_SYNTHETIC_TUNNEL=1",
                 "MCP_SYNTHETIC_CREDENTIALS=1",
+                "MCP_DOCKER_TRIAL_FULL_RUNTIME=1",
                 "MCP_CAS_SOCKET_PATH=/run/codex-mcp-lease/lease.sock"],
             "HostConfig":{"NetworkMode":"none","SecurityOpt":["no-new-privileges:true"],
                 "RestartPolicy":{"Name":"no"},
@@ -157,7 +232,7 @@ class RunnerDiagnosticsTests(unittest.TestCase):
 
         tunnel_spec = ContainerSpec.create(role="tunnel", run_id=run_id,
             image_id=image_id, memory_bytes=67108864, pids_limit=32,
-            gateway_id="d" * 64)
+            gateway_id="d" * 64, volume_name=volume.name)
         tunnel = json.loads(json.dumps(observed))
         tunnel_id = "b" * 64
         tunnel["Id"] = tunnel_id
@@ -165,21 +240,37 @@ class RunnerDiagnosticsTests(unittest.TestCase):
         tunnel["Config"]["Labels"]["codex.mcp.role"] = "tunnel"
         tunnel["Config"]["Cmd"] = ["tunnel", "--run-id", run_id]
         tunnel["Config"]["Env"] = ["PYTHONDONTWRITEBYTECODE=1",
-            "MCP_SYNTHETIC_TUNNEL=1", "MCP_SYNTHETIC_CREDENTIALS=1"]
+            "MCP_SYNTHETIC_TUNNEL=1", "MCP_SYNTHETIC_CREDENTIALS=1",
+            "MCP_DOCKER_TRIAL_FULL_RUNTIME=1"]
         tunnel["HostConfig"]["NetworkMode"] = tunnel_spec.network_mode
         tunnel["HostConfig"]["Memory"] = tunnel_spec.memory_bytes
         tunnel["HostConfig"]["MemorySwap"] = tunnel_spec.memory_swap_bytes
         tunnel["HostConfig"]["PidsLimit"] = tunnel_spec.pids_limit
-        tunnel["HostConfig"]["Mounts"] = []
-        tunnel["Mounts"] = []
+        tunnel["HostConfig"]["Mounts"] = [{"Type":"volume", "Source":volume.name,
+            "Target":"/var/lib/codex-mcp", "ReadOnly":True,
+            "VolumeOptions":{"NoCopy":True}}]
+        tunnel["Mounts"] = [{"Type":"volume", "Name":volume.name,
+            "Source":"/var/lib/docker/volumes/"+volume.name+"/_data",
+            "Destination":"/var/lib/codex-mcp", "Driver":"local", "Mode":"z",
+            "RW":False, "Propagation":""}]
         self.assertTrue(readback_checks_pass(container_readback_checks(tunnel_spec, tunnel,
             expected_state="created", expected_container_id=tunnel_id,
             image_labels=image_labels,
-            expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363")),
+            expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+            volume_mountpoint=tunnel["Mounts"][0]["Source"])),
             container_readback_checks(tunnel_spec, tunnel,
                 expected_state="created", expected_container_id=tunnel_id,
                 image_labels=image_labels,
-                expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363"))
+                expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+                volume_mountpoint=tunnel["Mounts"][0]["Source"]))
+
+        bad_readonly = json.loads(json.dumps(tunnel))
+        bad_readonly["Mounts"][0]["RW"] = True
+        self.assertFalse(readback_checks_pass(container_readback_checks(tunnel_spec,
+            bad_readonly, expected_state="created", expected_container_id=tunnel_id,
+            image_labels=image_labels,
+            expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+            volume_mountpoint=bad_readonly["Mounts"][0]["Source"])))
 
     def test_only_sentinel_payload_failure_with_verified_cleanup_can_continue(self):
         class Failure(Exception):
@@ -493,12 +584,19 @@ class RunnerDiagnosticsTests(unittest.TestCase):
         image_preflight = source.index('current_phase = "IMAGE_SENTINEL_PREFLIGHT"')
         volume_main = source.index('current_phase = "A_volume_init_readback"')
         phase_c = source.index('current_phase = "C_same_store_so_peercred_peer_pin"')
-        main_cleanup = source.index('current_phase = "MAIN_A_B_C_CLEANUP"')
+        main_cleanup = source.index('current_phase = "MAIN_D_E_CLEANUP"')
         actual_cleanup = source.index("lifecycle.cleanup()", main_cleanup)
         positive = source.index("engine.run_nocopy_positive_control(", actual_cleanup)
+        phase_d = source.index('current_phase = "D_gateway_tunnel_oauth_mcp_active_heartbeat"')
+        phase_e = source.index('current_phase = "E_deadline_ordinary_stop_and_expiry_guards"')
+        recovery = source.index('current_phase = "E_dead_controller_recovery_independent_lease"')
         self.assertLess(image_preflight, volume_main)
         self.assertLess(volume_main, phase_c)
         self.assertLess(phase_c, main_cleanup)
+        self.assertLess(phase_d, phase_e)
+        self.assertLess(phase_e, main_cleanup)
+        self.assertLess(actual_cleanup, recovery)
+        self.assertLess(recovery, positive)
         self.assertLess(actual_cleanup, positive)
 
     def test_rpc_server_stops_before_socket_close_without_thread_exception(self):
