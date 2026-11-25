@@ -191,6 +191,25 @@ class DockerEnginePreflightTests(unittest.TestCase):
             self.assertEqual(final.pins, {})
             self.assertEqual(final.creations, {})
 
+    def test_private_tunnel_entrypoint_imports_threading_for_health_server(self):
+        source_root = os.environ.get("DOCKER_TRIAL_SOURCE_ROOT")
+        if not source_root:
+            self.skipTest("private source is not staged in this local test invocation")
+        import ast
+        entrypoint = Path(source_root) / "tools/docker_trial_container_entrypoint.py"
+        tree = ast.parse(entrypoint.read_text(encoding="utf-8"))
+        imported = {alias.name.split(".", 1)[0]
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Import)
+                    for alias in node.names}
+        self.assertIn("threading", imported)
+        self.assertTrue(any(isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "Thread"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "threading"
+            for node in ast.walk(tree)))
+
     def test_cas_deadline_expiry_is_distinct_from_operational_stop(self):
         source = (Path(__file__).resolve().parent / "docker_lifecycle_runner.py").read_text()
         probe = source.index('current_phase = "E_cas_deadline_expiry_rejection"')
