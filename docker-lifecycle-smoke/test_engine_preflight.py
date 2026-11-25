@@ -3,6 +3,11 @@ import hashlib
 import tempfile
 import unittest
 import json
+import subprocess
+import sys
+import time
+import uuid
+import dataclasses
 from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
@@ -52,6 +57,199 @@ class DockerEnginePreflightTests(unittest.TestCase):
         self.assertIn("_locked_source_digest()", runner)
         self.assertIn('"archive_sha256"', runner)
         self.assertIn('hashlib.sha256(source_archive.read_bytes()).hexdigest() != source_sha', runner)
+
+    def test_workflow_gates_image_build_on_real_synthetic_config_validation(self):
+        root = Path(__file__).resolve().parent.parent
+        workflow = (root / ".github/workflows/docker-lifecycle-smoke.yml").read_text(encoding="utf-8")
+        self.assertIn("Validate the exact generated synthetic gateway configuration", workflow)
+        self.assertIn("validate-synthetic-config", workflow)
+        self.assertIn("steps.synthetic_config.outcome == 'success'", workflow)
+
+    def test_actual_generated_synthetic_configuration_passes_canonical_validator(self):
+        source_root = os.environ.get("DOCKER_TRIAL_SOURCE_ROOT")
+        if not source_root:
+            self.skipTest("private source is not staged in this local test invocation")
+        source_root = Path(source_root).resolve(strict=True)
+        entrypoint = source_root / "tools/docker_trial_container_entrypoint.py"
+        config = source_root / "config/mcp-oauth-runtime.example.json"
+        result = subprocess.run([sys.executable, "-B", str(entrypoint),
+            "validate-synthetic-config", "--example-config", str(config)],
+            cwd=str(source_root), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False,
+            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace")[-1000:])
+        summary = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(summary.get("status"), "PASS")
+        self.assertEqual(summary.get("canonical_validation"), "PASS")
+        self.assertIs(summary.get("canonical_resource_preserved"), True)
+        self.assertIs(summary.get("fixed_smb_destination_preserved"), True)
+        self.assertIs(summary.get("synthetic_oauth_endpoints"), True)
+
+    def test_tunnel_is_created_and_pinned_after_peer_auth_before_tunnel_id_reads(self):
+        source = (Path(__file__).resolve().parent / "docker_lifecycle_runner.py").read_text()
+        start = source.index('current_phase = "C_same_store_so_peercred_peer_pin"')
+        auth = source.index('if not gateway_probe_ok:', start)
+        tunnel_start = source.index('tunnel_id = lifecycle.start_tunnel(gateway_probe=True)', auth)
+        pin_readback = source.index('tunnel_pin = port.read_pin(run_id, "tunnel")', tunnel_start)
+        first_id_use = source.index('lifecycle.ids["tunnel"]', pin_readback)
+        self.assertLess(start, auth)
+        self.assertLess(auth, tunnel_start)
+        self.assertLess(tunnel_start, pin_readback)
+        self.assertLess(pin_readback, first_id_use)
+
+    def test_cas_deadline_expiry_is_distinct_from_operational_stop(self):
+        source = (Path(__file__).resolve().parent / "docker_lifecycle_runner.py").read_text()
+        probe = source.index('current_phase = "E_cas_deadline_expiry_rejection"')
+        ordinary_stop = source.index('current_phase = "E_deadline_ordinary_stop_and_expiry_guards"')
+        active_helper = source.index("def _run_active_cas_deadline_boundary")
+        heartbeat = source.index("port.heartbeat(run_id)", active_helper)
+        call = source.index("_run_active_cas_deadline_boundary(", probe)
+        self.assertLess(active_helper, heartbeat)
+        self.assertLess(probe, call)
+        self.assertLess(call, ordinary_stop)
+        self.assertIn('"expiry_clock_injected_for_boundary_test":True', source)
+        self.assertIn('"distinct_from_operational_deadline_stop"] = True', source)
+        self.assertIn('"main_runtime_state_during_test"] = "ACTIVE"', source)
+        self.assertIn('"cas_state_after_rejected_operation":"ACTIVE"', source)
+
+    def test_real_secure_store_rejects_resource_mutation_after_deadline_before_stopped(self):
+        source_root = os.environ.get("DOCKER_TRIAL_SOURCE_ROOT")
+        if not source_root:
+            self.skipTest("private source is not staged in this local test invocation")
+        sys.path.insert(0, source_root)
+        from tools.document_nas_local_service_lease_v2 import LeaseRecord, SecureLeaseV2Store
+        from tools.document_nas_docker_lease_port import SecureDockerLeasePort
+        with tempfile.TemporaryDirectory(prefix="lease-expiry-regression-") as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            cas_dir = root / "cas"
+            cas_dir.mkdir(mode=0o700)
+            run_id = str(uuid.uuid4())
+            now = time.monotonic()
+            pid = os.getpid()
+            start_ticks = "1"
+            uid, gid = os.geteuid(), os.getegid()
+            executable = os.path.realpath(sys.executable)
+            record = LeaseRecord.initial(run_id=run_id, boot_id=str(uuid.uuid4()),
+                mode="trial", owner_role="coordinator", owner_pid=pid,
+                owner_start_ticks=start_ticks, contract_digest="a" * 64, now=now,
+                phase_ttl=5.0, run_deadline_monotonic=now + 6.0)
+            record = dataclasses.replace(record, coordinator_pid=pid,
+                coordinator_start_ticks=start_ticks)
+            store = SecureLeaseV2Store(str(cas_dir), trusted_root=str(root),
+                owner_uid=uid, owner_gid=gid)
+            store.create(record)
+            clock = [now + 0.1]
+            port = SecureDockerLeasePort(store, run_id=run_id,
+                coordinator_pid=pid, coordinator_start_ticks=start_ticks,
+                monotonic=lambda: clock[0], coordinator_executable=executable,
+                identity_reader=lambda _pid: (uid, gid, start_ticks, executable))
+            labels = {"codex.mcp.trial":"1", "codex.mcp.run":run_id,
+                "codex.mcp.role":"runtime"}
+            self.assertTrue(port.persist_intent("codex-expiry-" + run_id[:8],
+                "sha256:" + "b" * 64, "sha256:" + "b" * 64, labels))
+            before = store.read()
+            clock[0] = before.run_deadline_monotonic + 0.01
+            with self.assertRaisesRegex(Exception, "DOCKER_RESOURCE_AUTHORIZATION_FAILED"):
+                port.begin_resource_creation(run_id, "volume",
+                    name="codex-expiry-" + run_id[:8], image_id="",
+                    volume_name="codex-expiry-" + run_id[:8], driver="local",
+                    labels=labels, network_mode="")
+            after = store.read()
+            self.assertEqual(after.docker_resources.state, "PREPARING")
+            self.assertEqual(after.sequence, before.sequence)
+            self.assertTrue(port.transition(run_id, "PREPARED", "STOPPING"))
+            self.assertTrue(port.transition(run_id, "STOPPING", "STOPPED"))
+            self.assertEqual(port.read_state(run_id), "STOPPED")
+
+    def test_linux_real_monotonic_cas_expiry_regression(self):
+        source_root = os.environ.get("DOCKER_TRIAL_SOURCE_ROOT")
+        if not source_root:
+            self.skipTest("private source is not staged in this local test invocation")
+        if not Path("/proc/sys/kernel/random/boot_id").is_file():
+            self.skipTest("real Linux boot identity is required for this CAS regression")
+        sys.path.insert(0, source_root)
+        import docker_lifecycle_runner as runner
+        from tools.document_nas_local_service_lease_v2 import LeaseRecord, SecureLeaseV2Store
+        from tools.document_nas_docker_lease_port import SecureDockerLeasePort
+        with tempfile.TemporaryDirectory(prefix="real-cas-expiry-") as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            result = runner._run_real_cas_expiry_regression(root=root,
+                LeaseRecord=LeaseRecord, SecureLeaseV2Store=SecureLeaseV2Store,
+                SecureDockerLeasePort=SecureDockerLeasePort,
+                boot_id=runner._kernel_boot_id(), contract_digest="c" * 64,
+                image_id="sha256:" + "d" * 64)
+            self.assertEqual(result.get("status"), "PASS")
+            self.assertIs(result.get("run_deadline_elapsed"), True)
+            self.assertIs(result.get("operation_rejected"), True)
+            self.assertIs(result.get("sequence_unchanged"), True)
+
+    def test_linux_active_cas_deadline_boundary_uses_real_secure_store(self):
+        source_root = os.environ.get("DOCKER_TRIAL_SOURCE_ROOT")
+        if not source_root:
+            self.skipTest("private source is not staged in this local test invocation")
+        if not Path("/proc/sys/kernel/random/boot_id").is_file():
+            self.skipTest("real Linux boot identity is required for this CAS regression")
+        sys.path.insert(0, source_root)
+        import docker_lifecycle_runner as runner
+        from tools.document_nas_local_service_lease_v2 import LeaseRecord, SecureLeaseV2Store
+        from tools.document_nas_docker_lease_port import SecureDockerLeasePort
+        with tempfile.TemporaryDirectory(prefix="active-cas-expiry-") as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            result = runner._run_active_cas_deadline_boundary(root=root,
+                LeaseRecord=LeaseRecord, SecureLeaseV2Store=SecureLeaseV2Store,
+                SecureDockerLeasePort=SecureDockerLeasePort,
+                boot_id=runner._kernel_boot_id(), contract_digest="e" * 64,
+                image_id="sha256:" + "f" * 64)
+            self.assertEqual(result.get("status"), "PASS")
+            self.assertEqual(result.get("cas_state_before"), "ACTIVE")
+            self.assertIs(result.get("heartbeat_rejected"), True)
+            self.assertIs(result.get("sequence_unchanged"), True)
+            self.assertIs(result.get("docker_resources_created"), False)
+
+    def test_secure_store_active_cas_deadline_boundary_rejects_without_stopping(self):
+        source_root = os.environ.get("DOCKER_TRIAL_SOURCE_ROOT")
+        if not source_root:
+            self.skipTest("private source is not staged in this local test invocation")
+        sys.path.insert(0, source_root)
+        import docker_lifecycle_runner as runner
+        from tools.document_nas_local_service_lease_v2 import LeaseRecord, SecureLeaseV2Store
+        from tools.document_nas_docker_lease_port import SecureDockerLeasePort
+        with tempfile.TemporaryDirectory(prefix="active-cas-boundary-") as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            pid, ticks = os.getpid(), "1"
+            uid, gid = os.geteuid(), os.getegid()
+            executable = os.path.realpath(sys.executable)
+            identity_reader = lambda _pid: (uid, gid, ticks, executable)
+            result = runner._run_active_cas_deadline_boundary(root=root,
+                LeaseRecord=LeaseRecord, SecureLeaseV2Store=SecureLeaseV2Store,
+                SecureDockerLeasePort=SecureDockerLeasePort,
+                boot_id=str(uuid.uuid4()), contract_digest="9" * 64,
+                image_id="sha256:" + "8" * 64,
+                identity_reader=identity_reader)
+            self.assertEqual(result.get("status"), "PASS")
+            self.assertEqual(result.get("cas_state_before"), "ACTIVE")
+            self.assertIs(result.get("heartbeat_rejected"), True)
+            self.assertIs(result.get("sequence_unchanged"), True)
+            self.assertEqual(result.get("final_cas_state"), "STOPPED")
+
+    def test_synthetic_backend_and_network_are_closed_to_external_services(self):
+        source_root = os.environ.get("DOCKER_TRIAL_SOURCE_ROOT")
+        if not source_root:
+            self.skipTest("private source is not staged in this local test invocation")
+        source_root = Path(source_root).resolve(strict=True)
+        fixture = (source_root / "tools/docker_trial_e2e_runtime.py").read_text()
+        entrypoint = (source_root / "src/mcp_document_oauth_entrypoint.py").read_text()
+        lifecycle = (source_root / "tools/document_nas_docker_named_volume_lifecycle.py").read_text()
+        self.assertIn("yield PrivateSmbGateway(_ReadOnlyFixtureStore())", fixture)
+        self.assertIn("if host != PRIVATE_SMB_HOST", fixture)
+        self.assertIn("ProxyHandler({})", fixture)
+        self.assertIn("fetch_jwks=lambda: fixture_jwks(settings), smb_factory=fixture_smb_factory", entrypoint)
+        self.assertIn('network_mode="none"', lifecycle)
+        self.assertIn('"container:" + gateway', lifecycle)
 
     def test_pinned_cli_endpoint_is_the_adapter_endpoint(self):
         with mock.patch.dict(os.environ, {"DOCKER_HOST": "unix:///var/run/docker.sock",

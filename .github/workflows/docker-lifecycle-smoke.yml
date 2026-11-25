@@ -48,9 +48,22 @@ jobs:
           python3 -B docker-lifecycle-smoke/prepare_docker_inputs.py \
             --root "$RUNNER_TEMP/docker-trial-inputs"
 
+      - name: Validate the exact generated synthetic gateway configuration
+        id: synthetic_config
+        if: steps.prepare.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          DOCKER_TRIAL_SOURCE_ROOT: ${{ runner.temp }}/docker-trial-inputs/source/application
+        run: |
+          set -euo pipefail
+          python3 -B "$DOCKER_TRIAL_SOURCE_ROOT/tools/docker_trial_container_entrypoint.py" \
+            validate-synthetic-config \
+            --example-config "$DOCKER_TRIAL_SOURCE_ROOT/config/mcp-oauth-runtime.example.json"
+
       - name: Verify private entrypoint, volume initialization, diagnostics and RPC on Linux
         id: rpc_test
-        if: steps.prepare.outcome == 'success'
+        if: steps.prepare.outcome == 'success' && steps.synthetic_config.outcome == 'success'
         continue-on-error: true
         shell: bash
         env:
@@ -61,6 +74,13 @@ jobs:
           set -euo pipefail
           PYTHONPATH="docker-lifecycle-smoke:$DOCKER_TRIAL_SOURCE_ROOT" \
             python3 -B -m unittest \
+            test_engine_preflight.DockerEnginePreflightTests.test_actual_generated_synthetic_configuration_passes_canonical_validator \
+            test_engine_preflight.DockerEnginePreflightTests.test_tunnel_is_created_and_pinned_after_peer_auth_before_tunnel_id_reads \
+            test_engine_preflight.DockerEnginePreflightTests.test_cas_deadline_expiry_is_distinct_from_operational_stop \
+            test_engine_preflight.DockerEnginePreflightTests.test_real_secure_store_rejects_resource_mutation_after_deadline_before_stopped \
+            test_engine_preflight.DockerEnginePreflightTests.test_linux_real_monotonic_cas_expiry_regression \
+            test_engine_preflight.DockerEnginePreflightTests.test_linux_active_cas_deadline_boundary_uses_real_secure_store \
+            test_engine_preflight.DockerEnginePreflightTests.test_synthetic_backend_and_network_are_closed_to_external_services \
             test_image_permissions \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_rpc_server_stops_before_socket_close_without_thread_exception \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_dead_controller_recovery_clears_creation_and_pin_atomically \
@@ -76,7 +96,7 @@ jobs:
 
       - name: Build unprivileged private test image by base digest
         id: image
-        if: steps.prepare.outcome == 'success' && steps.rpc_test.outcome == 'success'
+        if: steps.prepare.outcome == 'success' && steps.synthetic_config.outcome == 'success' && steps.rpc_test.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |

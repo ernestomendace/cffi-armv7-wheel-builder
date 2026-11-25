@@ -403,6 +403,184 @@ def _auxiliary_cas_volume(*, root, engine, LeaseRecord, SecureLeaseV2Store,
     return context
 
 
+def _run_real_cas_expiry_regression(*, root, LeaseRecord, SecureLeaseV2Store,
+                                   SecureDockerLeasePort, boot_id, contract_digest,
+                                   image_id):
+    """Wait for a short real monotonic lease to expire in the real CAS store."""
+    run_id = str(uuid.uuid4())
+    cas_dir = Path(root) / ("expiry-" + run_id.replace("-", ""))
+    cas_dir.mkdir(mode=0o700)
+    os.chmod(cas_dir, 0o700)
+    now = time.monotonic()
+    pid, ticks = os.getpid(), _proc_ticks(os.getpid())
+    deadline = now + 2.0
+    record = LeaseRecord.initial(run_id=run_id, boot_id=boot_id, mode="trial",
+        owner_role="coordinator", owner_pid=pid, owner_start_ticks=ticks,
+        contract_digest=contract_digest, now=now, phase_ttl=2.0,
+        run_deadline_monotonic=deadline)
+    record = dataclasses.replace(record, coordinator_pid=pid,
+        coordinator_start_ticks=ticks)
+    store = SecureLeaseV2Store(str(cas_dir), trusted_root=str(root),
+        owner_uid=os.geteuid(), owner_gid=os.getegid())
+    store.create(record)
+    port = SecureDockerLeasePort(store, run_id=run_id, coordinator_pid=pid,
+        coordinator_start_ticks=ticks, monotonic=time.monotonic)
+    labels = {"codex.mcp.trial":"1", "codex.mcp.run":run_id,
+        "codex.mcp.role":"runtime"}
+    volume_name = "codex-expiry-" + run_id.replace("-", "")[:12]
+    if not port.persist_intent(volume_name, image_id, image_id, labels):
+        raise TrialFailure("CAS_EXPIRY_INTENT_SETUP_FAILED")
+    while time.monotonic() <= deadline:
+        time.sleep(min(0.05, max(0.001, deadline - time.monotonic() + 0.001)))
+    before = store.read()
+    try:
+        port.begin_resource_creation(run_id, "volume", name=volume_name,
+            image_id="", volume_name=volume_name, driver="local", labels=labels,
+            network_mode="")
+        rejected = False
+        error_code = None
+    except Exception as exc:
+        rejected = True
+        error_code = getattr(exc, "category", getattr(exc, "code", type(exc).__name__[:80]))
+    after = store.read()
+    unchanged = after.sequence == before.sequence and after.docker_resources is not None \
+        and after.docker_resources.state == "PREPARING" \
+        and not (after.docker_resources.creations or {})
+    if not rejected or error_code != "DOCKER_RESOURCE_AUTHORIZATION_FAILED" or not unchanged:
+        raise TrialFailure("REAL_CAS_EXPIRY_DID_NOT_REJECT_MUTATION")
+    if not port.transition(run_id, "PREPARED", "STOPPING") \
+            or not port.transition(run_id, "STOPPING", "STOPPED"):
+        raise TrialFailure("EXPIRED_CAS_SAFE_TERMINATION_FAILED")
+    try:
+        port.persist_intent(volume_name, image_id, image_id, labels)
+        historical_intent_rejected = False
+    except Exception:
+        historical_intent_rejected = True
+    terminal = store.read()
+    if (port.read_state(run_id) != "STOPPED" or not historical_intent_rejected
+            or terminal.docker_resources is None or terminal.docker_resources.pins
+            or terminal.docker_resources.creations):
+        raise TrialFailure("EXPIRED_CAS_RECONCILIATION_FAILED")
+    return {"status":"PASS", "clock":"real_monotonic_elapsed",
+        "resource_state_before_rejected_operation":before.docker_resources.state,
+        "resource_state_after_rejected_operation":after.docker_resources.state,
+        "run_deadline_elapsed":time.monotonic() >= deadline,
+        "phase_deadline_elapsed":time.monotonic() >= before.phase_deadline_monotonic,
+        "operation_rejected":rejected, "error_code":error_code,
+        "sequence_unchanged":unchanged, "safe_terminal_cas":"STOPPED",
+        "historical_intent_reuse_rejected":historical_intent_rejected,
+        "pins_and_creation_records_absent":True}
+
+
+def _run_active_cas_deadline_boundary(*, root, LeaseRecord, SecureLeaseV2Store,
+                                      SecureDockerLeasePort, boot_id,
+                                      contract_digest, image_id,
+                                      identity_reader=None):
+    """Check expiry while CAS is ACTIVE using isolated real-store test pins.
+
+    No Docker resource is created here. This isolates the store's deadline
+    rejection from the live gateway's concurrent heartbeat RPCs.
+    """
+    run_id = str(uuid.uuid4())
+    cas_dir = Path(root) / ("active-expiry-" + run_id.replace("-", ""))
+    cas_dir.mkdir(mode=0o700)
+    os.chmod(cas_dir, 0o700)
+    now = time.monotonic()
+    deadline = now + 90.0
+    pid = os.getpid()
+    injected_identity = identity_reader(pid) if identity_reader is not None else None
+    if injected_identity is not None and (not isinstance(injected_identity, tuple)
+            or len(injected_identity) != 4 or not isinstance(injected_identity[2], str)
+            or not injected_identity[2].isdigit()):
+        raise TrialFailure("ACTIVE_EXPIRY_TEST_IDENTITY_INVALID")
+    ticks = injected_identity[2] if injected_identity is not None else _proc_ticks(pid)
+    record = LeaseRecord.initial(run_id=run_id, boot_id=boot_id, mode="trial",
+        owner_role="coordinator", owner_pid=pid, owner_start_ticks=ticks,
+        contract_digest=contract_digest, now=now, phase_ttl=90.0,
+        run_deadline_monotonic=deadline)
+    record = dataclasses.replace(record, coordinator_pid=pid,
+        coordinator_start_ticks=ticks)
+    store = SecureLeaseV2Store(str(cas_dir), trusted_root=str(root),
+        owner_uid=os.geteuid(), owner_gid=os.getegid())
+    store.create(record)
+    clock = [now + 0.1]
+    port_args = {}
+    if injected_identity is not None:
+        port_args = {"identity_reader":identity_reader,
+                     "coordinator_executable":injected_identity[3]}
+    port = SecureDockerLeasePort(store, run_id=run_id, coordinator_pid=pid,
+        coordinator_start_ticks=ticks, monotonic=lambda: clock[0], **port_args)
+    volume_name = "codex-active-expiry-" + run_id.replace("-", "")[:8]
+    intent_labels = {"codex.mcp.trial":"1", "codex.mcp.run":run_id,
+        "codex.mcp.role":"runtime"}
+    if not port.persist_intent(volume_name, image_id, image_id, intent_labels):
+        raise TrialFailure("ACTIVE_EXPIRY_INTENT_SETUP_FAILED")
+    if not port.begin_resource_creation(run_id, "volume", name=volume_name,
+            image_id="", volume_name=volume_name, driver="local",
+            labels=intent_labels, network_mode="") \
+            or not port.record_created_resource(run_id, "volume", volume_name) \
+            or not port.persist_volume_pin(run_id, volume_name, "local", intent_labels):
+        raise TrialFailure("ACTIVE_EXPIRY_VOLUME_PIN_SETUP_FAILED")
+    gateway_id, tunnel_id = "a" * 64, "b" * 64
+    gateway_name = "codex-mcp-trial-gw-" + run_id.replace("-", "")
+    gateway_labels = {"codex.mcp.trial":"1", "codex.mcp.run":run_id,
+        "codex.mcp.role":"gateway"}
+    if not port.begin_resource_creation(run_id, "gateway", name=gateway_name,
+            image_id=image_id, volume_name=volume_name, driver="",
+            labels=gateway_labels, network_mode="none") \
+            or not port.record_created_resource(run_id, "gateway", gateway_id) \
+            or not port.persist_pin(run_id, "gateway", gateway_id, image_id, volume_name):
+        raise TrialFailure("ACTIVE_EXPIRY_GATEWAY_PIN_SETUP_FAILED")
+    tunnel_name = "codex-mcp-trial-tu-" + run_id.replace("-", "")
+    tunnel_labels = {"codex.mcp.trial":"1", "codex.mcp.run":run_id,
+        "codex.mcp.role":"tunnel"}
+    if not port.begin_resource_creation(run_id, "tunnel", name=tunnel_name,
+            image_id=image_id, volume_name="", driver="", labels=tunnel_labels,
+            network_mode="container:" + gateway_id) \
+            or not port.record_created_resource(run_id, "tunnel", tunnel_id) \
+            or not port.persist_pin(run_id, "tunnel", tunnel_id, image_id, ""):
+        raise TrialFailure("ACTIVE_EXPIRY_TUNNEL_PIN_SETUP_FAILED")
+    if not port.transition(run_id, "PREPARED", "ACTIVE"):
+        raise TrialFailure("ACTIVE_EXPIRY_CAS_TRANSITION_FAILED")
+    before = store.read()
+    if before.docker_resources is None or before.docker_resources.state != "ACTIVE":
+        raise TrialFailure("ACTIVE_EXPIRY_CAS_READBACK_FAILED")
+    expiry_clock_value = deadline + 0.001
+    clock[0] = expiry_clock_value
+    try:
+        port.heartbeat(run_id)
+        rejected, error_code = False, None
+    except Exception as exc:
+        rejected = True
+        error_code = getattr(exc, "category", getattr(exc, "code", type(exc).__name__[:80]))
+    after = store.read()
+    unchanged = (after.sequence == before.sequence and after.docker_resources is not None
+        and after.docker_resources.state == "ACTIVE")
+    if not rejected or error_code != "DOCKER_RESOURCE_AUTHORIZATION_FAILED" or not unchanged:
+        raise TrialFailure("ACTIVE_CAS_DEADLINE_NOT_ENFORCED")
+    # Restore pre-expiry clock for a normal, identity-specific CAS teardown.
+    clock[0] = now + 1.0
+    if not port.transition(run_id, "ACTIVE", "STOPPING"):
+        raise TrialFailure("ACTIVE_EXPIRY_CAS_STOPPING_FAILED")
+    if not port.clear_pin(run_id, "tunnel", tunnel_id) \
+            or not port.clear_pin(run_id, "gateway", gateway_id) \
+            or not port.clear_volume_pin(run_id, volume_name):
+        raise TrialFailure("ACTIVE_EXPIRY_CAS_PIN_CLEAR_FAILED")
+    if not port.transition(run_id, "STOPPING", "STOPPED"):
+        raise TrialFailure("ACTIVE_EXPIRY_CAS_STOPPED_FAILED")
+    final = store.read().docker_resources
+    if (final is None or final.state != "STOPPED" or final.pins or final.creations):
+        raise TrialFailure("ACTIVE_EXPIRY_CAS_RECONCILIATION_FAILED")
+    return {"status":"PASS", "cas_state_before":"ACTIVE",
+        "cas_state_after_rejected_operation":"ACTIVE", "operation":"heartbeat",
+        "run_deadline_elapsed_by_test_clock":expiry_clock_value >= deadline,
+        "expiry_clock_injected_for_boundary_test":True,
+        "heartbeat_rejected":rejected, "error_code":error_code,
+        "sequence_unchanged":unchanged, "docker_resources_created":False,
+        "test_pin_records":True, "final_cas_state":"STOPPED",
+        "pins_and_creation_records_absent":True}
+
+
 def _remove_auxiliary_volume(*, context, engine):
     from tools.document_nas_docker_named_volume_lifecycle import validate_volume_readback
     run_id, volume, port = context["run_id"], context["volume"], context["port"]
@@ -1073,6 +1251,30 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         report["application_rpc_count"] = rpc.application_success_count
         report["phases"][current_phase] = "PASS"
 
+        # The tunnel must be created, pinned and started only after the
+        # gateway's real CAS peer identity has been authenticated. Earlier
+        # runner versions indexed tunnel specs/IDs without ever preparing the
+        # tunnel resource, then could mark ACTIVE based on an unstarted role.
+        peer_evidence = report.get("container_peer_observation", {})
+        gateway_probe_ok = (rpc.application_success_count >= 1
+            and rpc.application_last_operation == "read_state"
+            and peer_evidence.get("process_identity_verified") is True
+            and peer_evidence.get("container_running") is True
+            and peer_evidence.get("namespace_pid_match") is True)
+        if not gateway_probe_ok:
+            raise TrialFailure("TUNNEL_START_GATEWAY_IDENTITY_PROBE_FAILED")
+        current_phase = "C_tunnel_create_pin_start"
+        report["phases"][current_phase] = "RUNNING"
+        tunnel_id = lifecycle.start_tunnel(gateway_probe=True)
+        tunnel_pin = port.read_pin(run_id, "tunnel")
+        if not tunnel_id or not isinstance(tunnel_pin, dict) \
+                or tunnel_pin.get("container_id") != tunnel_id:
+            raise TrialFailure("TUNNEL_PIN_READBACK_FAILED")
+        report["tunnel_creation_pin_start"] = {
+            "status": "PASS", "created_and_started": True,
+            "gateway_identity_probe": "PASS", "pin_readback": "PASS"}
+        report["phases"][current_phase] = "PASS"
+
         current_phase = "D_gateway_tunnel_oauth_mcp_active_heartbeat"
         report["phases"][current_phase] = "RUNNING"
         gateway_before = engine.inspect_container(lifecycle.ids["gateway"])
@@ -1161,6 +1363,34 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         report["phases"][current_phase] = "PASS"
         report["phases"]["D_full_runtime"] = "PASS"
 
+        # Exercise the active-state expiry boundary in an isolated real CAS
+        # record. Do not perturb the main port clock: the resident gateway
+        # continues its authenticated heartbeat RPC concurrently.
+        current_phase = "E_cas_deadline_expiry_rejection"
+        report["phases"][current_phase] = "RUNNING"
+        active_before_expiry = store.read()
+        if (active_before_expiry.docker_resources is None
+                or active_before_expiry.docker_resources.state != "ACTIVE"
+                or active_before_expiry.run_deadline_monotonic is None):
+            raise TrialFailure("CAS_EXPIRY_PRECONDITION_NOT_ACTIVE")
+        report["cas_lease_expiry"] = _run_active_cas_deadline_boundary(
+            root=temp_root, LeaseRecord=LeaseRecord,
+            SecureLeaseV2Store=SecureLeaseV2Store,
+            SecureDockerLeasePort=SecureDockerLeasePort, boot_id=boot,
+            contract_digest=source_digest, image_id=image)
+        report["cas_lease_expiry"]["main_runtime_state_during_test"] = "ACTIVE"
+        report["cas_lease_expiry"]["distinct_from_operational_deadline_stop"] = True
+        report["phases"][current_phase] = "PASS"
+
+        current_phase = "E_real_monotonic_cas_expiration"
+        report["phases"][current_phase] = "RUNNING"
+        report["cas_real_expiration"] = _run_real_cas_expiry_regression(
+            root=temp_root, LeaseRecord=LeaseRecord,
+            SecureLeaseV2Store=SecureLeaseV2Store,
+            SecureDockerLeasePort=SecureDockerLeasePort, boot_id=boot,
+            contract_digest=source_digest, image_id=image)
+        report["phases"][current_phase] = "PASS"
+
         current_phase = "E_deadline_ordinary_stop_and_expiry_guards"
         report["phases"][current_phase] = "RUNNING"
         deadline_started = time.monotonic()
@@ -1186,6 +1416,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             raise TrialFailure("POST_TERMINAL_OPERATION_NOT_REJECTED")
         report["phases"][current_phase] = "PASS"
         report["phases"]["E_deadline_expiry_guards"] = "PASS"
+
         current_phase = "MAIN_D_E_CLEANUP"
         report["phases"][current_phase] = "RUNNING"
         lifecycle.cleanup()
