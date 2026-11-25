@@ -97,6 +97,100 @@ class DockerEnginePreflightTests(unittest.TestCase):
         self.assertLess(tunnel_start, pin_readback)
         self.assertLess(pin_readback, first_id_use)
 
+    def test_tunnel_volume_identity_survives_cas_intent_pin_reload_and_cleanup(self):
+        source_root = os.environ.get("DOCKER_TRIAL_SOURCE_ROOT")
+        if not source_root:
+            self.skipTest("private source is not staged in this local test invocation")
+        sys.path.insert(0, source_root)
+        from tools.document_nas_local_service_lease_v2 import LeaseRecord, SecureLeaseV2Store
+        from tools.document_nas_docker_lease_port import SecureDockerLeasePort
+
+        uid, gid, pid = os.geteuid(), os.getegid(), os.getpid()
+        ticks = "12345"
+        executable = os.path.realpath(sys.executable)
+        run_id = str(uuid.uuid4())
+        suffix = run_id.replace("-", "")
+        gateway_image = "sha256:" + "1" * 64
+        tunnel_image = "sha256:" + "2" * 64
+        gateway_id, tunnel_id = "a" * 64, "b" * 64
+        now = time.monotonic()
+
+        with tempfile.TemporaryDirectory(prefix="tunnel-volume-cas-") as temp:
+            root = Path(temp); root.chmod(0o700)
+            cas_dir = root / "cas"; cas_dir.mkdir(mode=0o700)
+            record = LeaseRecord.initial(run_id=run_id, boot_id=str(uuid.uuid4()),
+                mode="trial", owner_role="coordinator", owner_pid=pid,
+                owner_start_ticks=ticks, contract_digest="c" * 64, now=now,
+                phase_ttl=200.0, run_deadline_monotonic=now + 280.0)
+            record = dataclasses.replace(record, coordinator_pid=pid,
+                coordinator_start_ticks=ticks)
+            store = SecureLeaseV2Store(str(cas_dir), trusted_root=str(root),
+                owner_uid=uid, owner_gid=gid)
+            store.create(record)
+            port = SecureDockerLeasePort(store, run_id=run_id,
+                coordinator_pid=pid, coordinator_start_ticks=ticks,
+                monotonic=lambda: now, coordinator_executable=executable,
+                identity_reader=lambda _pid: (uid, gid, ticks, executable))
+
+            volume = "codex-mcp-trial-" + suffix
+            runtime_labels = {"codex.mcp.trial":"1", "codex.mcp.run":run_id,
+                "codex.mcp.role":"runtime"}
+            self.assertTrue(port.persist_intent(volume, gateway_image, tunnel_image,
+                                                runtime_labels))
+            self.assertTrue(port.begin_resource_creation(run_id, "volume", name=volume,
+                image_id="", volume_name=volume, driver="local", labels=runtime_labels))
+            self.assertTrue(port.record_created_resource(run_id, "volume", volume))
+            self.assertTrue(port.persist_volume_pin(run_id, volume, "local", runtime_labels))
+
+            gateway_labels = {"codex.mcp.trial":"1", "codex.mcp.run":run_id,
+                "codex.mcp.role":"gateway"}
+            gateway_name = "codex-mcp-trial-gw-" + suffix
+            self.assertTrue(port.begin_resource_creation(run_id, "gateway",
+                name=gateway_name, image_id=gateway_image, volume_name=volume,
+                driver="", labels=gateway_labels, network_mode="none"))
+            self.assertTrue(port.record_created_resource(run_id, "gateway", gateway_id))
+            self.assertTrue(port.persist_pin(run_id, "gateway", gateway_id,
+                                             gateway_image, volume))
+
+            tunnel_labels = {"codex.mcp.trial":"1", "codex.mcp.run":run_id,
+                "codex.mcp.role":"tunnel"}
+            tunnel_name = "codex-mcp-trial-tu-" + suffix
+            with self.assertRaisesRegex(Exception, "DOCKER_CREATION_INTENT_INVALID"):
+                port.begin_resource_creation(run_id, "tunnel", name=tunnel_name,
+                    image_id=tunnel_image, volume_name="", driver="",
+                    labels=tunnel_labels, network_mode="container:" + gateway_id)
+            self.assertTrue(port.begin_resource_creation(run_id, "tunnel",
+                name=tunnel_name, image_id=tunnel_image, volume_name=volume,
+                driver="", labels=tunnel_labels,
+                network_mode="container:" + gateway_id))
+            self.assertTrue(port.record_created_resource(run_id, "tunnel", tunnel_id))
+            with self.assertRaisesRegex(Exception, "DOCKER_RESOURCE_PIN_MISMATCH"):
+                port.persist_pin(run_id, "tunnel", tunnel_id, tunnel_image,
+                                 "codex-mcp-trial-other")
+            self.assertTrue(port.persist_pin(run_id, "tunnel", tunnel_id,
+                                             tunnel_image, volume))
+            self.assertEqual(port.read_pin(run_id, "tunnel")["volume_name"], volume)
+            self.assertEqual(port.read_creation_record(run_id, "tunnel")["volume_name"], volume)
+
+            # Reload the actual CAS journal as a recovery process would.
+            recovered_store = SecureLeaseV2Store(str(cas_dir), trusted_root=str(root),
+                owner_uid=uid, owner_gid=gid)
+            recovered = SecureDockerLeasePort(recovered_store, run_id=run_id,
+                coordinator_pid=pid, coordinator_start_ticks=ticks,
+                monotonic=lambda: now, coordinator_executable=executable,
+                identity_reader=lambda _pid: (uid, gid, ticks, executable))
+            self.assertEqual(recovered.read_pin(run_id, "tunnel")["volume_name"], volume)
+            self.assertEqual(recovered.read_creation_record(run_id, "tunnel")["volume_name"], volume)
+            self.assertTrue(recovered.transition(run_id, "PREPARED", "STOPPING"))
+            self.assertTrue(recovered.clear_pin(run_id, "tunnel", tunnel_id))
+            self.assertTrue(recovered.clear_pin(run_id, "gateway", gateway_id))
+            self.assertTrue(recovered.clear_volume_pin(run_id, volume))
+            self.assertTrue(recovered.transition(run_id, "STOPPING", "STOPPED"))
+            final = recovered_store.read().docker_resources
+            self.assertEqual(final.state, "STOPPED")
+            self.assertEqual(final.pins, {})
+            self.assertEqual(final.creations, {})
+
     def test_cas_deadline_expiry_is_distinct_from_operational_stop(self):
         source = (Path(__file__).resolve().parent / "docker_lifecycle_runner.py").read_text()
         probe = source.index('current_phase = "E_cas_deadline_expiry_rejection"')

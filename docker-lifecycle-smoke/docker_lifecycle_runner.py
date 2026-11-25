@@ -535,10 +535,10 @@ def _run_active_cas_deadline_boundary(*, root, LeaseRecord, SecureLeaseV2Store,
     tunnel_labels = {"codex.mcp.trial":"1", "codex.mcp.run":run_id,
         "codex.mcp.role":"tunnel"}
     if not port.begin_resource_creation(run_id, "tunnel", name=tunnel_name,
-            image_id=image_id, volume_name="", driver="", labels=tunnel_labels,
+            image_id=image_id, volume_name=volume_name, driver="", labels=tunnel_labels,
             network_mode="container:" + gateway_id) \
             or not port.record_created_resource(run_id, "tunnel", tunnel_id) \
-            or not port.persist_pin(run_id, "tunnel", tunnel_id, image_id, ""):
+            or not port.persist_pin(run_id, "tunnel", tunnel_id, image_id, volume_name):
         raise TrialFailure("ACTIVE_EXPIRY_TUNNEL_PIN_SETUP_FAILED")
     if not port.transition(run_id, "PREPARED", "ACTIVE"):
         raise TrialFailure("ACTIVE_EXPIRY_CAS_TRANSITION_FAILED")
