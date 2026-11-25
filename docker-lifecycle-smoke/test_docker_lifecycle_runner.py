@@ -1,4 +1,8 @@
 import errno
+import base64
+import contextlib
+import io
+import json
 import os
 import socket
 import stat
@@ -6,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -81,10 +86,87 @@ class RunnerDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("private socket path", repr(detail))
         self.assertTrue(all("/" not in frame["file"] for frame in detail["stack"]))
 
+    def test_actual_adapter_sentinel_command_passes_real_entrypoint_parser(self):
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
+                self.fail("PRIVATE_ENTRYPOINT_TEST_SOURCE_ROOT_MISSING")
+            self.skipTest("private archive is staged only in the Linux trial job")
+        from tools.document_nas_docker_engine_v141 import DockerEngineV141
+        from tools.document_nas_docker_named_volume_lifecycle import VolumeSpec
+        from tools import docker_trial_container_entrypoint as entry
+        run_id = "11111111-1111-4111-8111-111111111111"
+        image_id = "sha256:" + "a" * 64
+        volume = VolumeSpec.for_run(run_id)
+        _name, request = DockerEngineV141.nocopy_positive_control_request(
+            run_id=run_id, volume=volume, image_id=image_id,
+            memory_bytes=32 * 1024 * 1024, pids_limit=8)
+        self.assertEqual(request["Entrypoint"], ["python3", "/opt/codex-mcp/bin/container-entrypoint.py"])
+        self.assertEqual(request["Cmd"], ["nocopy-positive-control"])
+        self.assertIs(request["HostConfig"]["Mounts"][0]["VolumeOptions"]["NoCopy"], False)
+        self.assertEqual(request["HostConfig"]["NetworkMode"], "none")
+        with tempfile.TemporaryDirectory() as directory:
+            sentinel = Path(directory) / ".codex-volume-copy-sentinel"
+            sentinel.write_bytes(entry.NOCOPY_SENTINEL_BYTES)
+            sentinel.chmod(0o444)
+            with unittest.mock.patch.object(entry, "APP_UID", os.geteuid()), \
+                 unittest.mock.patch.object(entry, "APP_GID", os.getegid()), \
+                 unittest.mock.patch.object(entry, "RUNTIME", Path(directory)), \
+                 unittest.mock.patch.object(entry, "NOCOPY_SENTINEL", sentinel), \
+                 unittest.mock.patch.object(entry, "_mountpoint", return_value=True), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                # Python passes Cmd as sys.argv[1:] after the image Entrypoint script.
+                argv = request["Cmd"]
+                result = entry.main(argv)
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue())["phase"], "nocopy_positive_control")
+
+    def test_entrypoint_argparse_failure_is_structured(self):
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
+                self.fail("PRIVATE_ENTRYPOINT_TEST_SOURCE_ROOT_MISSING")
+            self.skipTest("private archive is staged only in the Linux trial job")
+        from tools import docker_trial_container_entrypoint as entry
+        with contextlib.redirect_stderr(io.StringIO()) as output:
+            result = entry.main(["not-a-valid-mode"])
+        self.assertEqual(result, 2)
+        report = json.loads(output.getvalue())
+        self.assertEqual((report["component"], report["phase"], report["code"]),
+                         ("container_entrypoint", "argument_parse", "ARGUMENTS_INVALID"))
+
+    def test_nocopy_raw_payload_capture_is_private_bounded_and_exact(self):
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
+                self.fail("PRIVATE_ENTRYPOINT_TEST_SOURCE_ROOT_MISSING")
+            self.skipTest("private archive is staged only in the Linux trial job")
+        from tools.document_nas_docker_engine_v141 import _bounded_nocopy_payload
+        stderr = b"e" * 5000
+        stdout = b"o" * 1000
+        report = _bounded_nocopy_payload({"stdout":stdout, "stderr":stderr})
+        kept = base64.b64decode(report["private_payload_stderr_b64"])
+        kept += base64.b64decode(report["private_payload_stdout_b64"])
+        self.assertEqual(len(kept), 4096)
+        self.assertEqual(kept, b"e" * 4096)
+        self.assertEqual(report["private_payload_bytes_observed"], 6000)
+        self.assertEqual(report["private_payload_bytes_omitted"], 1904)
+        self.assertNotIn("e" * 100, repr(report))
+
     def test_failed_phase_does_not_remain_running(self):
         report = {"phases": {"A_nocopy_positive_control": "RUNNING"}}
         _mark_phase_failed(report, "A_nocopy_positive_control")
         self.assertEqual(report["phases"]["A_nocopy_positive_control"], "FAIL")
+
+    def test_nocopy_control_runs_only_after_main_cleanup_in_runner(self):
+        source = Path(__file__).with_name("docker_lifecycle_runner.py").read_text(encoding="utf-8")
+        image_preflight = source.index('current_phase = "IMAGE_SENTINEL_PREFLIGHT"')
+        volume_main = source.index('current_phase = "A_volume_init_readback"')
+        phase_c = source.index('current_phase = "C_same_store_so_peercred_peer_pin"')
+        main_cleanup = source.index('current_phase = "MAIN_A_B_C_CLEANUP"')
+        actual_cleanup = source.index("lifecycle.cleanup()", main_cleanup)
+        positive = source.index("engine.run_nocopy_positive_control(", actual_cleanup)
+        self.assertLess(image_preflight, volume_main)
+        self.assertLess(volume_main, phase_c)
+        self.assertLess(phase_c, main_cleanup)
+        self.assertLess(actual_cleanup, positive)
 
     def test_rpc_server_stops_before_socket_close_without_thread_exception(self):
         required = os.environ.get("DOCKER_TRIAL_REQUIRE_REAL_RPC_TEST") == "1"

@@ -605,6 +605,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
     rpc_thread = None
     rpc_thread_errors = []
     lifecycle = None
+    lifecycle_cleanup_verified = False
     engine = None
     store = None
     port = None
@@ -715,32 +716,28 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         report["readback_cleanup_regression"]["resource_cleanup_verified"] = cleanup_context["removed"]
         report["phases"][current_phase] = "PASS"
 
-        current_phase = "A_nocopy_positive_control"
+        current_phase = "IMAGE_SENTINEL_PREFLIGHT"
         report["phases"][current_phase] = "RUNNING"
-        nocopy_context = _auxiliary_cas_volume(root=temp_root, engine=engine,
+        sentinel_context = _auxiliary_cas_volume(root=temp_root, engine=engine,
             LeaseRecord=LeaseRecord, SecureLeaseV2Store=SecureLeaseV2Store,
             SecureDockerLeasePort=SecureDockerLeasePort, kernel_boot_id=boot,
             contract_digest=source_digest, image_id=image, contexts=auxiliary_contexts)
         try:
-            report["nocopy_positive_control"] = engine.run_nocopy_positive_control(
-                run_id=nocopy_context["run_id"], volume=nocopy_context["volume"],
-                image_id=image, lease=nocopy_context["port"])
+            report["image_sentinel_preflight"] = engine.verify_image_sentinel_before_mount(
+                run_id=sentinel_context["run_id"], image_id=image,
+                volume_name=sentinel_context["volume"].name,
+                lease=sentinel_context["port"])
         except Exception as exc:
-            payload_failure = _nocopy_failure_is_payload_only(exc)
-            if payload_failure is None:
-                raise
-            report["nocopy_positive_control"] = {"status":"FAIL_DIAGNOSTIC_ONLY",
-                "isolated_failure":payload_failure}
-            report["failed_phase"] = current_phase
-            report["phases"][current_phase] = "FAIL_DIAGNOSTIC_ONLY"
-            _remove_auxiliary_volume(context=nocopy_context, engine=engine)
-            report["nocopy_positive_control"]["resource_cleanup_verified"] = nocopy_context["removed"]
-            if not nocopy_context["removed"]:
-                raise TrialFailure("NOCOPY_AUXILIARY_CLEANUP_UNVERIFIED")
-        else:
-            _remove_auxiliary_volume(context=nocopy_context, engine=engine)
-            report["nocopy_positive_control"]["resource_cleanup_verified"] = nocopy_context["removed"]
-            report["phases"][current_phase] = "PASS"
+            report["image_sentinel_preflight"] = {
+                "status":"FAIL", **_safe_exception_details(exc, current_phase),
+                "code":getattr(exc, "code", "IMAGE_SENTINEL_PREFLIGHT_FAILED")}
+            raise
+        finally:
+            _remove_auxiliary_volume(context=sentinel_context, engine=engine)
+            report["image_sentinel_preflight"]["resource_cleanup_verified"] = sentinel_context["removed"]
+        if not sentinel_context["removed"]:
+            raise TrialFailure("IMAGE_SENTINEL_AUXILIARY_CLEANUP_UNVERIFIED")
+        report["phases"][current_phase] = "PASS"
 
         current_phase = "A_volume_init_readback"
         report["phases"][current_phase] = "RUNNING"
@@ -785,12 +782,56 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         report["application_rpc_count"] = rpc.application_success_count
         report["phases"]["D_full_runtime"] = "NOT_EXECUTED"
         report["phases"]["E_deadline_recovery"] = "NOT_EXECUTED"
-        if report["phases"].get("A_nocopy_positive_control") == "FAIL_DIAGNOSTIC_ONLY":
-            report["status"] = "PARTIAL_A_B_C_NOCOPY_DIAGNOSTIC_FAILURE"
-            return_code = 1
-        else:
-            report["status"] = "PASS_A_B_C"
+        current_phase = "MAIN_A_B_C_CLEANUP"
+        report["phases"][current_phase] = "RUNNING"
+        lifecycle.cleanup()
+        main_final = store.read()
+        main_resources = main_final.docker_resources
+        main_cleanup_verified = (
+            engine.inspect_volume(lifecycle.volume.name) is None
+            and all(engine.inspect_container(cid) is None for cid in lifecycle.ids.values())
+            and main_resources is not None and main_resources.state == "STOPPED"
+            and not (main_resources.pins or {}) and not (main_resources.creations or {})
+            and port.read_volume_pin(run_id) is None
+            and port.read_initializer_pin(run_id) is None
+            and port.read_installer_pin(run_id) is None
+            and all(port.read_pin(run_id, role) is None for role in ("gateway", "tunnel")))
+        if not main_cleanup_verified:
+            raise TrialFailure("MAIN_A_B_C_CLEANUP_UNVERIFIED")
+        lifecycle_cleanup_verified = True
+        report["main_a_b_c_cleanup"] = "PASS"
+        report["phases"][current_phase] = "PASS"
+
+        # The NoCopy=false control is supplemental and has its own independent CAS.
+        # It runs only after A-C and their cleanup have been read back as complete.
+        current_phase = "POST_MAIN_NOCOPY_POSITIVE_CONTROL"
+        report["phases"][current_phase] = "RUNNING"
+        nocopy_context = _auxiliary_cas_volume(root=temp_root, engine=engine,
+            LeaseRecord=LeaseRecord, SecureLeaseV2Store=SecureLeaseV2Store,
+            SecureDockerLeasePort=SecureDockerLeasePort, kernel_boot_id=boot,
+            contract_digest=source_digest, image_id=image, contexts=auxiliary_contexts)
+        try:
+            report["nocopy_positive_control"] = engine.run_nocopy_positive_control(
+                run_id=nocopy_context["run_id"], volume=nocopy_context["volume"],
+                image_id=image, lease=nocopy_context["port"])
+            report["phases"][current_phase] = "PASS"
+        except Exception as exc:
+            report["nocopy_positive_control"] = {"status":"FAIL",
+                "code":getattr(exc, "code", "NOCOPY_CONTROL_UNEXPECTED"),
+                "diagnostics":getattr(exc, "diagnostics", None) or
+                    _safe_exception_details(exc, current_phase)}
+            _mark_phase_failed(report, current_phase)
+        finally:
+            _remove_auxiliary_volume(context=nocopy_context, engine=engine)
+            report["nocopy_positive_control"]["resource_cleanup_verified"] = nocopy_context["removed"]
+        if not nocopy_context["removed"]:
+            raise TrialFailure("NOCOPY_AUXILIARY_CLEANUP_UNVERIFIED")
+        if report["phases"].get(current_phase) == "PASS":
+            report["status"] = "PASS_A_B_C_NOCOPY_CONTROL"
             return_code = 0
+        else:
+            report["status"] = "PARTIAL_A_B_C_NOCOPY_CONTROL_FAILED"
+            return_code = 1
     except Exception as exc:
         code = getattr(exc, "code", "DOCKER_TRIAL_UNEXPECTED")
         report["status"] = "FAIL"
@@ -817,7 +858,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             except Exception as exc:
                 context["cleanup_reconciled"] = False
                 context["cleanup_error"] = getattr(exc, "code", "AUX_CLEANUP_UNCERTAIN")
-        if lifecycle is not None:
+        if lifecycle is not None and not lifecycle_cleanup_verified:
             try:
                 lifecycle.cleanup()
                 report["cleanup"] = "PASS"
@@ -825,6 +866,9 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             except Exception as exc:
                 report["cleanup"] = "FAIL"
                 report["cleanup_error"] = getattr(exc, "code", "CLEANUP_UNCERTAIN")
+        elif lifecycle is not None and lifecycle_cleanup_verified:
+            report["cleanup"] = "PASS"
+            cleanup_ok = True
         if engine is not None:
             report["container_diagnostics"] = list(
                 getattr(engine, "container_diagnostics", [])[-32:])
@@ -945,10 +989,11 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         result_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="ascii")
         os.chmod(result_path, 0o600)
     print("DOCKER_TRIAL_STATUS=" + str(report["status"]))
-    for name in ("A_readback_failure_cleanup_regression", "A_nocopy_positive_control",
+    for name in ("A_readback_failure_cleanup_regression", "IMAGE_SENTINEL_PREFLIGHT",
                  "A_volume_init_readback",
                  "B_offline_installer_import_cgroup",
-                 "C_same_store_so_peercred_peer_pin", "D_full_runtime", "E_deadline_recovery"):
+                 "C_same_store_so_peercred_peer_pin", "MAIN_A_B_C_CLEANUP",
+                 "POST_MAIN_NOCOPY_POSITIVE_CONTROL", "D_full_runtime", "E_deadline_recovery"):
         print("DOCKER_TRIAL_{}={}".format(name, report.get("phases", {}).get(name, "NOT_REACHED")))
     return return_code
 
