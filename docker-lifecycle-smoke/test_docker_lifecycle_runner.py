@@ -133,6 +133,182 @@ class RunnerDiagnosticsTests(unittest.TestCase):
         self.assertEqual((report["component"], report["phase"], report["code"]),
                          ("container_entrypoint", "argument_parse", "ARGUMENTS_INVALID"))
 
+    def test_real_volume_initializer_transfers_ownership_without_post_transfer_path_walk(self):
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
+                self.fail("PRIVATE_ENTRYPOINT_TEST_SOURCE_ROOT_MISSING")
+            self.skipTest("private archive is staged only in the Linux trial job")
+        from tools import docker_trial_container_entrypoint as entry
+        run_id = "11111111-1111-4111-8111-111111111111"
+        current_uid, current_gid = os.getuid(), os.getgid()
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "volume"
+            runtime.mkdir(mode=0o700)
+            sentinel = runtime / entry.NOCOPY_SENTINEL.name
+            events = []
+            real_fchown, real_fstat, real_lstat = os.fchown, os.fstat, os.lstat
+
+            def tracked_fchown(fd, uid, gid):
+                events.append(("fchown", uid, gid))
+                return real_fchown(fd, uid, gid)
+
+            def tracked_fstat(fd):
+                events.append(("fstat",))
+                return real_fstat(fd)
+
+            def tracked_lstat(path):
+                events.append(("lstat", str(path)))
+                return real_lstat(path)
+
+            with unittest.mock.patch.object(entry, "RUNTIME", runtime), \
+                 unittest.mock.patch.object(entry, "APP_UID", current_uid), \
+                 unittest.mock.patch.object(entry, "APP_GID", current_gid), \
+                 unittest.mock.patch.object(entry, "NOCOPY_SENTINEL", sentinel), \
+                 unittest.mock.patch.object(entry, "_mountpoint", return_value=True), \
+                 unittest.mock.patch.object(entry.os, "geteuid", return_value=0), \
+                 unittest.mock.patch.object(entry.os, "fchown", side_effect=tracked_fchown), \
+                 unittest.mock.patch.object(entry.os, "fstat", side_effect=tracked_fstat), \
+                 unittest.mock.patch.object(entry.os, "lstat", side_effect=tracked_lstat):
+                entry.initialize_volume(run_id=run_id, runtime=runtime)
+
+            for name in ("drop", "python", "state"):
+                info = (runtime / name).stat()
+                self.assertEqual((info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)),
+                                 (current_uid, current_gid, 0o700))
+            self.assertEqual(json.loads((runtime / "state" / "volume-init-result.json").read_text()),
+                {"schema": 1, "status": "PASS", "run_id": run_id,
+                 "app_uid": current_uid, "app_gid": current_gid, "mode": "0700",
+                 "nocopy_sentinel_absent": True})
+            first_directory_transfer = next(i for i, event in enumerate(events)
+                if event[0] == "fchown" and event[1:] == (current_uid, current_gid))
+            self.assertTrue(any(event[0] == "fstat" for event in events[first_directory_transfer:]))
+            self.assertFalse(any(event[0] == "lstat" for event in events[first_directory_transfer:]))
+
+    def test_volume_initializer_reports_filesystem_errno_and_rolls_back_partial_transfer(self):
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
+                self.fail("PRIVATE_ENTRYPOINT_TEST_SOURCE_ROOT_MISSING")
+            self.skipTest("private archive is staged only in the Linux trial job")
+        from tools import docker_trial_container_entrypoint as entry
+        run_id = "11111111-1111-4111-8111-111111111111"
+        current_uid, current_gid = os.getuid(), os.getgid()
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "volume"
+            runtime.mkdir(mode=0o700)
+            sentinel = runtime / entry.NOCOPY_SENTINEL.name
+            real_fchown = os.fchown
+            transfers = 0
+
+            def fail_once_during_transfer(fd, uid, gid):
+                nonlocal transfers
+                if uid == current_uid and gid == current_gid:
+                    transfers += 1
+                    if transfers == 2:
+                        raise OSError(errno.EACCES, "fixture permission failure")
+                return real_fchown(fd, uid, gid)
+
+            with unittest.mock.patch.object(entry, "RUNTIME", runtime), \
+                 unittest.mock.patch.object(entry, "APP_UID", current_uid), \
+                 unittest.mock.patch.object(entry, "APP_GID", current_gid), \
+                 unittest.mock.patch.object(entry, "NOCOPY_SENTINEL", sentinel), \
+                 unittest.mock.patch.object(entry, "_mountpoint", return_value=True), \
+                 unittest.mock.patch.object(entry.os, "geteuid", return_value=0), \
+                 unittest.mock.patch.object(entry.os, "fchown", side_effect=fail_once_during_transfer):
+                with self.assertRaises(entry.TrialEntrypointError) as caught:
+                    entry.initialize_volume(run_id=run_id, runtime=runtime)
+            diagnostic = caught.exception.diagnostics["filesystem"]
+            self.assertEqual(caught.exception.code, "FILESYSTEM_OPERATION_FAILED")
+            self.assertEqual(diagnostic["logical_directory"], "runtime_python")
+            self.assertEqual(diagnostic["operation"], "fchown")
+            self.assertEqual(diagnostic["subphase"], "transfer_ownership")
+            self.assertEqual(diagnostic["exception_class"], "PermissionError")
+            self.assertEqual(diagnostic["errno"], errno.EACCES)
+            self.assertEqual(diagnostic["effective_uid"], 0)
+            self.assertIn("effective_capabilities_hex", diagnostic)
+            self.assertEqual(list(runtime.iterdir()), [])
+
+    def test_docker_log_collector_preserves_only_sanitized_filesystem_diagnostics(self):
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
+                self.fail("PRIVATE_ENTRYPOINT_TEST_SOURCE_ROOT_MISSING")
+            self.skipTest("private archive is staged only in the Linux trial job")
+        from tools.document_nas_docker_engine_v141 import _safe_application_log_records
+        event = {"schema": 1, "status": "FAIL", "phase": "volume_init",
+            "component": "container_entrypoint", "code": "FILESYSTEM_OPERATION_FAILED",
+            "diagnostics": {"filesystem": {"logical_directory": "runtime_python",
+                "operation": "fchown", "subphase": "transfer_ownership",
+                "exception_class": "PermissionError", "errno": errno.EACCES,
+                "effective_uid": 0, "effective_gid": 0,
+                "effective_capabilities_hex": "0000000000000001",
+                "observed": {"kind": "directory", "uid": 0, "gid": 0, "mode": "0700"},
+                "expected": {"uid": 61001, "gid": 61001, "mode": "0700"}}}}
+        good = _safe_application_log_records((json.dumps(event) + "\n").encode())[0]
+        self.assertEqual(good["diagnostics"]["filesystem"]["errno"], errno.EACCES)
+        self.assertEqual(good["diagnostics"]["filesystem"]["logical_directory"],
+                         "runtime_python")
+        self.assertNotIn("path", repr(good).lower())
+        event["diagnostics"]["filesystem"]["private_path"] = "/host/private"
+        rejected = _safe_application_log_records((json.dumps(event) + "\n").encode())[0]
+        self.assertNotIn("diagnostics", rejected)
+
+    def test_directory_contract_failure_reports_logical_id_and_expected_observed(self):
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
+                self.fail("PRIVATE_ENTRYPOINT_TEST_SOURCE_ROOT_MISSING")
+            self.skipTest("private archive is staged only in the Linux trial job")
+        from tools import docker_trial_container_entrypoint as entry
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            missing = runtime / "drop"
+            with unittest.mock.patch.object(entry, "RUNTIME", runtime):
+                with self.assertRaises(entry.TrialEntrypointError) as caught:
+                    entry._require_directory(missing, uid=os.getuid(), gid=os.getgid(), mode=0o700)
+            diagnostic = caught.exception.diagnostics["filesystem"]
+            self.assertEqual(diagnostic["logical_directory"], "runtime_drop")
+            self.assertEqual(diagnostic["operation"], "lstat")
+            self.assertEqual(diagnostic["errno"], errno.ENOENT)
+            self.assertNotIn(str(runtime), repr(diagnostic))
+
+    def test_initializer_failure_survives_entrypoint_and_docker_log_sanitizer(self):
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
+                self.fail("PRIVATE_ENTRYPOINT_TEST_SOURCE_ROOT_MISSING")
+            self.skipTest("private archive is staged only in the Linux trial job")
+        from tools import docker_trial_container_entrypoint as entry
+        from tools.document_nas_docker_engine_v141 import _safe_application_log_records
+        run_id = "11111111-1111-4111-8111-111111111111"
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "volume"
+            runtime.mkdir(mode=0o700)
+            sentinel = runtime / entry.NOCOPY_SENTINEL.name
+            real_mkdir = os.mkdir
+
+            def fail_python_directory(name, mode=0o777, *, dir_fd=None):
+                if name == "python":
+                    raise OSError(errno.EACCES, "host path must not be retained")
+                return real_mkdir(name, mode, dir_fd=dir_fd)
+
+            with unittest.mock.patch.object(entry, "RUNTIME", runtime), \
+                 unittest.mock.patch.object(entry, "APP_UID", os.getuid()), \
+                 unittest.mock.patch.object(entry, "APP_GID", os.getgid()), \
+                 unittest.mock.patch.object(entry, "NOCOPY_SENTINEL", sentinel), \
+                 unittest.mock.patch.object(entry, "_mountpoint", return_value=True), \
+                 unittest.mock.patch.object(entry.os, "geteuid", return_value=0), \
+                 unittest.mock.patch.object(entry.os, "mkdir", side_effect=fail_python_directory), \
+                 contextlib.redirect_stderr(io.StringIO()) as stderr:
+                result = entry.main(["init", "--run-id", run_id])
+            self.assertEqual(result, 2)
+            emitted = json.loads(stderr.getvalue())
+            self.assertEqual(emitted["code"], "FILESYSTEM_OPERATION_FAILED")
+            records = _safe_application_log_records(stderr.getvalue().encode("utf-8"))
+            fs = records[0]["diagnostics"]["filesystem"]
+            self.assertEqual(fs["logical_directory"], "runtime_python")
+            self.assertEqual(fs["operation"], "mkdir")
+            self.assertEqual(fs["errno"], errno.EACCES)
+            self.assertEqual(fs["effective_uid"], 0)
+            self.assertNotIn(str(runtime), repr(records))
+            self.assertEqual(list(runtime.iterdir()), [])
+
     def test_nocopy_raw_payload_capture_is_private_bounded_and_exact(self):
         if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
             if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":

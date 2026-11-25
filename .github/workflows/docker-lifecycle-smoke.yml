@@ -45,7 +45,7 @@ jobs:
           python3 -B docker-lifecycle-smoke/prepare_docker_inputs.py \
             --root "$RUNNER_TEMP/docker-trial-inputs"
 
-      - name: Verify private entrypoint request and RPC shutdown on Linux
+      - name: Verify private entrypoint, volume initialization, diagnostics and RPC on Linux
         id: rpc_test
         if: steps.prepare.outcome == 'success'
         continue-on-error: true
@@ -61,7 +61,12 @@ jobs:
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_rpc_server_stops_before_socket_close_without_thread_exception \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_actual_adapter_sentinel_command_passes_real_entrypoint_parser \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_entrypoint_argparse_failure_is_structured \
-            test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_nocopy_raw_payload_capture_is_private_bounded_and_exact
+            test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_nocopy_raw_payload_capture_is_private_bounded_and_exact \
+            test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_real_volume_initializer_transfers_ownership_without_post_transfer_path_walk \
+            test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_volume_initializer_reports_filesystem_errno_and_rolls_back_partial_transfer \
+            test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_directory_contract_failure_reports_logical_id_and_expected_observed \
+            test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_docker_log_collector_preserves_only_sanitized_filesystem_diagnostics \
+            test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_initializer_failure_survives_entrypoint_and_docker_log_sanitizer
 
       - name: Build unprivileged private test image by base digest
         id: image
