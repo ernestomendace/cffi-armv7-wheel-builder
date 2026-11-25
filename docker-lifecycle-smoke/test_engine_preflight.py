@@ -14,6 +14,17 @@ from docker_lifecycle_runner import (
 
 
 class DockerEnginePreflightTests(unittest.TestCase):
+    def test_built_image_permission_check_gates_trial_and_runs_before_it(self):
+        root = Path(__file__).resolve().parent.parent
+        workflow = (root / ".github/workflows/docker-lifecycle-smoke.yml").read_text()
+        verifier = root / "docker-lifecycle-smoke/verify_image_permissions.py"
+        self.assertTrue(verifier.is_file())
+        self.assertIn("id: image_permissions", workflow)
+        self.assertIn("verify_image_permissions.py", workflow)
+        self.assertIn("steps.image_permissions.outcome == 'success'", workflow)
+        self.assertLess(workflow.index("Verify built image access for application UID"),
+                        workflow.index("Run phases A-C with real Docker Engine"))
+
     def test_private_source_lock_matches_loader_and_runner_reaches_real_regression(self):
         root = Path(__file__).resolve().parent
         lock = json.loads((root / "docker-lifecycle-lock.json").read_text(encoding="ascii"))

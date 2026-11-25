@@ -58,6 +58,7 @@ jobs:
           set -euo pipefail
           PYTHONPATH="docker-lifecycle-smoke:$DOCKER_TRIAL_SOURCE_ROOT" \
             python3 -B -m unittest \
+            test_image_permissions \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_rpc_server_stops_before_socket_close_without_thread_exception \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_actual_adapter_sentinel_command_passes_real_entrypoint_parser \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_entrypoint_argparse_failure_is_structured \
@@ -85,9 +86,19 @@ jobs:
             --file "$ROOT/tools/Dockerfile.ex4100-trial" "$ROOT"
           test -s "$IID"
 
+      - name: Verify built image access for application UID
+        id: image_permissions
+        if: steps.image.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B docker-lifecycle-smoke/verify_image_permissions.py \
+            --iid-file "$RUNNER_TEMP/docker-trial-inputs/image.iid"
+
       - name: Run phases A-C with real Docker Engine and SecureLeaseV2Store
         id: trial
-        if: steps.image.outcome == 'success'
+        if: steps.image.outcome == 'success' && steps.image_permissions.outcome == 'success'
         continue-on-error: true
         shell: bash
         env:
@@ -166,10 +177,12 @@ jobs:
           IMAGE_CLEANUP_OUTCOME: ${{ steps.image_cleanup.outcome }}
           ENCRYPT_OUTCOME: ${{ steps.encrypt.outcome }}
           RPC_TEST_OUTCOME: ${{ steps.rpc_test.outcome }}
+          IMAGE_PERMISSION_OUTCOME: ${{ steps.image_permissions.outcome }}
         run: |
-          printf 'Input preparation: %s\nLinux RPC regression: %s\nImage build: %s\nReal Docker/CAS trial: %s\nImage cleanup: %s\nEncrypted diagnostics: %s\n' \
-            "$PREPARE_OUTCOME" "$RPC_TEST_OUTCOME" "$IMAGE_OUTCOME" "$TRIAL_OUTCOME" "$IMAGE_CLEANUP_OUTCOME" "$ENCRYPT_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Input preparation: %s\nLinux RPC regression: %s\nImage build: %s\nImage UID access: %s\nReal Docker/CAS trial: %s\nImage cleanup: %s\nEncrypted diagnostics: %s\n' \
+            "$PREPARE_OUTCOME" "$RPC_TEST_OUTCOME" "$IMAGE_OUTCOME" "$IMAGE_PERMISSION_OUTCOME" "$TRIAL_OUTCOME" "$IMAGE_CLEANUP_OUTCOME" "$ENCRYPT_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
           if [[ "$PREPARE_OUTCOME" != success || "$RPC_TEST_OUTCOME" != success || "$IMAGE_OUTCOME" != success || \
+                "$IMAGE_PERMISSION_OUTCOME" != success || \
                 "$TRIAL_OUTCOME" != success || "$IMAGE_CLEANUP_OUTCOME" != success || \
                 "$ENCRYPT_OUTCOME" != success ]]; then
             exit 1
