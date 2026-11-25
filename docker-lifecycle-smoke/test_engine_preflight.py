@@ -3,6 +3,7 @@ import hashlib
 import tempfile
 import unittest
 import json
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -123,6 +124,25 @@ class DockerEnginePreflightTests(unittest.TestCase):
             os.symlink(target, lease / "lease-v2.json")
             with self.assertRaises(TrialFailure):
                 _preserve_cas_for_reconciliation(str(run), str(results))
+
+    def test_cas_recovery_preserves_auxiliary_authorities_separately(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            main = root / "lease"
+            aux = root / "aux-lease"
+            results = root / "results"
+            for path in (main, aux, results):
+                path.mkdir(mode=0o700)
+            (main / "lease-v2.json").write_bytes(b"main-state")
+            (aux / "lease-v2.json").write_bytes(b"aux-state")
+            contexts = [{"store":SimpleNamespace(directory=str(aux))}]
+            hashes = _preserve_cas_for_reconciliation(str(root), str(results), contexts)
+            recovery = results / "cas-recovery"
+            self.assertEqual((recovery / "lease-v2.json").read_bytes(), b"main-state")
+            self.assertEqual((recovery / "auxiliary-00" / "lease-v2.json").read_bytes(),
+                             b"aux-state")
+            self.assertEqual(hashes["auxiliary_0"]["lease-v2.json"],
+                             hashlib.sha256(b"aux-state").hexdigest())
 
 
 if __name__ == "__main__":

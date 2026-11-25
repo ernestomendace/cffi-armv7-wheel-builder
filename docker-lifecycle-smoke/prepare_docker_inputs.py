@@ -13,9 +13,9 @@ import tarfile
 import urllib.parse
 import urllib.request
 
-SOURCE_SHA256 = "55c846474a1e1d40d8ba7cc64573ea0ea4f63ab2b1fa91d99ee2a1a17552edff"
-SOURCE_BYTES = 103154
-SOURCE_FILES = 23
+SOURCE_SHA256 = "f58c17d31cd2fbb2a64ca61210f13696661d0ed5ab2ca5d2230f2dc8e2880568"
+SOURCE_BYTES = 106711
+SOURCE_FILES = 24
 PARTS = 4
 MAX_PART = 40000
 MAX_SOURCE = 120000  # four 40,000-character Base64 Actions secrets
@@ -82,7 +82,8 @@ def _extract(data, root, expected_files):
                 if len(payload) != member.size:
                     raise InputError("SOURCE_MEMBER_SIZE_MISMATCH")
                 output.write(payload)
-            target.chmod(0o600)
+            target.chmod(0o444 if rel.as_posix() ==
+                         "application/tools/docker_trial_volume_sentinel" else 0o600)
     if count != expected_files:
         raise InputError("SOURCE_FILE_COUNT_MISMATCH")
     for required in ("tools/Dockerfile.ex4100-trial",

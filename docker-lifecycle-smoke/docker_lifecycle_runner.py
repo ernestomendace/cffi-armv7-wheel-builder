@@ -277,6 +277,155 @@ def _engine_peer_proof(peer_pid, peer_uid, peer_gid, socket_path, socket_inode):
     return dict(base, error_code="ENGINE_PEER_IDENTITY_UNVERIFIED")
 
 
+def _auxiliary_cas_volume(*, root, engine, LeaseRecord, SecureLeaseV2Store,
+                          SecureDockerLeasePort, kernel_boot_id, contract_digest,
+                          image_id, contexts=None, now_fn=time.monotonic):
+    """Create one isolated run CAS plus one volume, recording identity before use."""
+    from tools.document_nas_docker_named_volume_lifecycle import (
+        VolumeSpec, validate_volume_readback,
+    )
+    run_id = str(uuid.uuid4())
+    run_dir = Path(root) / ("aux-" + run_id.replace("-", ""))
+    run_dir.mkdir(mode=0o700)
+    os.chmod(run_dir, 0o700)
+    now = now_fn()
+    pid, ticks = os.getpid(), _proc_ticks(os.getpid())
+    record = LeaseRecord.initial(run_id=run_id, boot_id=kernel_boot_id, mode="trial",
+        owner_role="coordinator", owner_pid=pid, owner_start_ticks=ticks,
+        contract_digest=contract_digest, now=now, phase_ttl=270.0,
+        run_deadline_monotonic=now + 280.0)
+    record = dataclasses.replace(record, coordinator_pid=pid, coordinator_start_ticks=ticks)
+    store = SecureLeaseV2Store(str(run_dir), trusted_root=str(root), owner_uid=0, owner_gid=0)
+    store.create(record)
+    port = SecureDockerLeasePort(store, run_id=run_id, coordinator_pid=pid,
+        coordinator_start_ticks=ticks, monotonic=now_fn)
+    volume = VolumeSpec.for_run(run_id)
+    context = {"run_id":run_id, "store":store, "port":port, "volume":volume,
+               "image_id":image_id, "created":False, "removed":False}
+    if contexts is not None:
+        contexts.append(context)
+    labels = dict(volume.labels)
+    if port.persist_intent(volume.name, image_id, image_id, labels) is not True:
+        raise TrialFailure("AUX_CAS_INTENT_FAILED")
+    if engine.inspect_volume(volume.name) is not None:
+        raise TrialFailure("AUX_VOLUME_COLLISION")
+    if port.begin_resource_creation(run_id, "volume", name=volume.name, image_id="",
+            volume_name=volume.name, driver="local", labels=labels) is not True:
+        raise TrialFailure("AUX_VOLUME_CREATE_INTENT_FAILED")
+    if engine.create_volume(volume) is not True:
+        raise TrialFailure("AUX_VOLUME_CREATE_FAILED")
+    if port.record_created_resource(run_id, "volume", volume.name) is not True:
+        raise TrialFailure("AUX_VOLUME_IDENTITY_CAS_FAILED")
+    actual = engine.inspect_volume(volume.name)
+    if not isinstance(actual, dict) or not validate_volume_readback(volume, actual):
+        raise TrialFailure("AUX_VOLUME_READBACK_FAILED")
+    if not isinstance(actual.get("Mountpoint"), str) or not actual["Mountpoint"].startswith("/"):
+        raise TrialFailure("AUX_VOLUME_MOUNTPOINT_INVALID")
+    if port.persist_volume_pin(run_id, volume.name, volume.driver, labels) is not True:
+        raise TrialFailure("AUX_VOLUME_PIN_FAILED")
+    if port.read_volume_pin(run_id) != {"name":volume.name,"driver":"local","labels":labels}:
+        raise TrialFailure("AUX_VOLUME_PIN_READBACK_FAILED")
+    context["created"] = True
+    return context
+
+
+def _remove_auxiliary_volume(*, context, engine):
+    from tools.document_nas_docker_named_volume_lifecycle import validate_volume_readback
+    run_id, volume, port = context["run_id"], context["volume"], context["port"]
+    current = engine.inspect_volume(volume.name)
+    creation = port.read_creation_record(run_id, "volume")
+    if port.transition(run_id, "PREPARED", "STOPPING") is not True:
+        raise TrialFailure("AUX_CAS_STOPPING_FAILED")
+    if current is not None:
+        if (not isinstance(creation, dict)
+                or creation.get("role") != "volume"
+                or creation.get("run_id") != run_id
+                or creation.get("name") != volume.name
+                or creation.get("driver") != "local"
+                or creation.get("labels") != dict(volume.labels)
+                or not isinstance(current, dict) or not validate_volume_readback(volume, current)):
+            raise TrialFailure("AUX_VOLUME_OWNERSHIP_UNVERIFIED")
+        if creation is not None and creation.get("state") == "INTENDED":
+            if port.record_created_resource(run_id, "volume", volume.name) is not True:
+                raise TrialFailure("AUX_VOLUME_ID_RECOVERY_FAILED")
+            creation = port.read_creation_record(run_id, "volume")
+        if creation is not None and creation.get("resource_id") != volume.name:
+            raise TrialFailure("AUX_VOLUME_CAS_IDENTITY_MISMATCH")
+        if engine.remove_volume(volume.name) is not True:
+            raise TrialFailure("AUX_VOLUME_REMOVE_FAILED")
+    if engine.inspect_volume(volume.name) is not None:
+        raise TrialFailure("AUX_VOLUME_REMOVE_READBACK_FAILED")
+    volume_pin = port.read_volume_pin(run_id)
+    if volume_pin is not None:
+        if port.clear_volume_pin(run_id, volume.name) is not True:
+            raise TrialFailure("AUX_VOLUME_PIN_CLEAR_FAILED")
+    elif creation is not None:
+        if creation.get("state") == "VERIFIED" or port.clear_unverified_creation(
+                run_id, "volume", creation.get("resource_id", "")) is not True:
+            raise TrialFailure("AUX_VOLUME_CREATION_CLEAR_FAILED")
+    if port.read_volume_pin(run_id) is not None or port.read_creation_record(run_id, "volume") is not None:
+        raise TrialFailure("AUX_VOLUME_CAS_RESIDUAL")
+    if port.transition(run_id, "STOPPING", "STOPPED") is not True:
+        raise TrialFailure("AUX_CAS_STOPPED_FAILED")
+    if engine.inspect_volume(volume.name) is not None:
+        raise TrialFailure("AUX_VOLUME_RESIDUAL")
+    context["removed"] = True
+
+
+def _cleanup_auxiliary_context(*, context, engine, expected_base_digest):
+    """Reconcile only exact ID/name/image/run/role objects in this auxiliary CAS."""
+    from tools.document_nas_docker_named_volume_lifecycle import _container_belongs_to_creation
+    run_id, port = context["run_id"], context["port"]
+    name = "codex-mcp-trial-install-" + run_id.replace("-", "")
+    actual = engine.inspect_container_name(name)
+    creation = port.read_creation_record(run_id, "installer")
+    if actual is not None:
+        evidence = engine.inspect_image(context["image_id"])
+        if creation is not None and creation.get("state") == "INTENDED":
+            if not _container_belongs_to_creation(creation, actual,
+                    image_labels=evidence.config_labels,
+                    expected_base_digest=expected_base_digest):
+                raise TrialFailure("AUX_CONTAINER_OWNERSHIP_UNVERIFIED")
+            cid = actual.get("Id")
+            if not isinstance(cid, str) or port.record_created_resource(
+                    run_id, "installer", cid) is not True:
+                raise TrialFailure("AUX_CONTAINER_ID_RECOVERY_FAILED")
+            creation = port.read_creation_record(run_id, "installer")
+        if not isinstance(creation, dict) or not _container_belongs_to_creation(
+                creation, actual, image_labels=evidence.config_labels,
+                expected_base_digest=expected_base_digest):
+            raise TrialFailure("AUX_CONTAINER_OWNERSHIP_UNVERIFIED")
+        cid = actual.get("Id")
+        state = actual.get("State", {}).get("Status")
+        if state == "running":
+            engine.stop_container(cid, 5)
+            actual = engine.inspect_container(cid)
+            state = actual.get("State", {}).get("Status") if isinstance(actual, dict) else None
+        if state not in ("created", "exited", "dead"):
+            raise TrialFailure("AUX_CONTAINER_STATE_UNCERTAIN")
+        engine.remove_container(cid)
+        if engine.inspect_container(cid) is not None or engine.inspect_container_name(name) is not None:
+            raise TrialFailure("AUX_CONTAINER_REMOVE_READBACK_FAILED")
+        pin = port.read_installer_pin(run_id)
+        if pin is not None:
+            if pin.get("container_id") != cid or port.clear_installer_pin(run_id, cid) is not True:
+                raise TrialFailure("AUX_INSTALLER_PIN_CLEAR_FAILED")
+        else:
+            if creation.get("state") == "VERIFIED" or port.clear_unverified_creation(
+                    run_id, "installer", cid) is not True:
+                raise TrialFailure("AUX_INSTALLER_CREATION_CLEAR_FAILED")
+    elif creation is not None:
+        if creation.get("state") == "INTENDED":
+            if port.clear_unverified_creation(run_id, "installer", "") is not True:
+                raise TrialFailure("AUX_INSTALLER_INTENT_CLEAR_FAILED")
+        elif creation.get("state") == "CREATED":
+            if port.clear_unverified_creation(run_id, "installer", creation.get("resource_id", "")) is not True:
+                raise TrialFailure("AUX_INSTALLER_ABSENCE_CLEAR_FAILED")
+        else:
+            raise TrialFailure("AUX_VERIFIED_INSTALLER_PIN_MISSING")
+    _remove_auxiliary_volume(context=context, engine=engine)
+
+
 def _docker_cli_socket():
     """The workflow pins DOCKER_HOST and disables context overrides explicitly."""
     if os.environ.get("DOCKER_CONTEXT"):
@@ -290,38 +439,54 @@ def _docker_cli_socket():
     return path
 
 
-def _preserve_cas_for_reconciliation(temp_root, result_dir):
-    source = Path(temp_root) / "lease"
+def _preserve_cas_for_reconciliation(temp_root, result_dir, auxiliary_contexts=()):
     target = Path(result_dir) / "cas-recovery"
     target.mkdir(mode=0o700)
-    hashes = {}
-    for name in ("lease-v2.json", "lease-v2.lock"):
-        path = source / name
-        try:
-            info = os.lstat(str(path))
-        except FileNotFoundError:
-            continue
-        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-            raise TrialFailure("CAS_RECOVERY_FILE_UNSAFE")
-        payload = path.read_bytes()
-        destination = target / name
-        fd = os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-        except BaseException:
+    os.chmod(target, 0o700)
+
+    def copy_store(source, destination, *, create_directory):
+        if create_directory:
+            destination.mkdir(mode=0o700)
+            os.chmod(destination, 0o700)
+        hashes = {}
+        for name in ("lease-v2.json", "lease-v2.lock"):
+            path = Path(source) / name
             try:
-                destination.unlink()
-            except OSError:
-                pass
-            raise
-        if destination.read_bytes() != payload:
-            raise TrialFailure("CAS_RECOVERY_READBACK_FAILED")
-        hashes[name] = hashlib.sha256(payload).hexdigest()
-    if not hashes:
-        raise TrialFailure("CAS_RECOVERY_STATE_MISSING")
+                info = os.lstat(str(path))
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise TrialFailure("CAS_RECOVERY_FILE_UNSAFE")
+            payload = path.read_bytes()
+            copied = destination / name
+            fd = os.open(str(copied), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except BaseException:
+                try:
+                    copied.unlink()
+                except OSError:
+                    pass
+                raise
+            if copied.read_bytes() != payload:
+                raise TrialFailure("CAS_RECOVERY_READBACK_FAILED")
+            hashes[name] = hashlib.sha256(payload).hexdigest()
+        if not hashes:
+            raise TrialFailure("CAS_RECOVERY_STATE_MISSING")
+        return hashes
+
+    hashes = copy_store(Path(temp_root) / "lease", target,
+                        create_directory=False)
+    for index, context in enumerate(auxiliary_contexts):
+        store = context.get("store") if isinstance(context, dict) else None
+        source = getattr(store, "directory", None)
+        if not isinstance(source, str):
+            raise TrialFailure("AUX_CAS_RECOVERY_SOURCE_INVALID")
+        hashes["auxiliary_{}".format(index)] = copy_store(
+            source, target / "auxiliary-{:02d}".format(index), create_directory=True)
     return hashes
 
 
@@ -346,7 +511,8 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
     )
     from tools.document_nas_docker_engine_v141 import DockerEngineV141
     from tools.document_nas_docker_named_volume_lifecycle import (
-        APPROVED_BASE_AMD64, NamedVolumeTrialLifecycle,
+        APPROVED_BASE_AMD64, NamedVolumeTrialLifecycle, VolumeSpec,
+        container_readback_checks, readback_checks_pass,
     )
     if APPROVED_BASE_AMD64 != BASE_DIGEST:
         raise TrialFailure("X86_BASE_DIGEST_POLICY_MISMATCH")
@@ -363,6 +529,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
     engine = None
     store = None
     port = None
+    auxiliary_contexts = []
     image = image_id
     try:
         lease_dir = Path(temp_root) / "lease"
@@ -426,16 +593,23 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             initial["container_running"] = state.get("Running") is True
             initial["container_user"] = config.get("User")
             initial["container_image"] = config.get("Image")
-            initial["container_labels_match"] = config.get("Labels") == {
-                "codex.mcp.trial":"1", "codex.mcp.run":run_id, "codex.mcp.role":"gateway"}
-            identity_ok = (observed.get("Id") == cid and state.get("Running") is True
+            spec = current.specs.get("gateway") if current is not None else None
+            evidence = current.image_evidence.get(image) if current is not None else None
+            checks = (container_readback_checks(spec, observed, expected_state="running",
+                expected_container_id=cid, image_labels=evidence.config_labels,
+                image_env=evidence.config_env, expected_base_digest=BASE_DIGEST,
+                volume_mountpoint=current.volume_mountpoint)
+                if spec is not None and evidence is not None else [])
+            label_check = next((item for item in checks if item.get("field") == "Config.Labels"), None)
+            initial["container_labels_match"] = bool(label_check and label_check.get("result") is True)
+            initial["container_config_readback"] = checks
+            identity_ok = (readback_checks_pass(checks)
+                and observed.get("Id") == cid and state.get("Running") is True
                 and expected_pid == peer_pid
                 and (peer_proc.get("uid_effective"), peer_proc.get("gid_effective")) == (peer_uid, peer_gid)
                 and os.path.basename(peer_proc.get("exe_path", "")) == "python3.9"
                 and config.get("User") == "61001:61001"
-                and config.get("Image") == image
-                and config.get("Labels") == {"codex.mcp.trial":"1",
-                    "codex.mcp.run":run_id, "codex.mcp.role":"gateway"})
+                and config.get("Image") == image)
             initial["process_identity_verified"] = bool(identity_ok)
             return bool(identity_ok)
         rpc = DockerLeaseRPCServer(str(socket_path), port, peer_uid=61001,
@@ -451,14 +625,40 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             cas_socket_host_path=str(socket_path), dependency_profile="x86_64-validation")
         lifecycle.approve_non_nas_validation()
         report["admission"] = "NON_NAS_X86_CI_ONLY"
+        current_phase = "A_readback_failure_cleanup_regression"
+        report["phases"][current_phase] = "RUNNING"
+        cleanup_context = _auxiliary_cas_volume(root=temp_root, engine=engine,
+            LeaseRecord=LeaseRecord, SecureLeaseV2Store=SecureLeaseV2Store,
+            SecureDockerLeasePort=SecureDockerLeasePort, kernel_boot_id=boot,
+            contract_digest=source_digest, image_id=image, contexts=auxiliary_contexts)
+        report["readback_cleanup_regression"] = engine.run_real_readback_cleanup_regression(
+            run_id=cleanup_context["run_id"], volume=cleanup_context["volume"],
+            image_id=image, lease=cleanup_context["port"])
+        regression_container_name = "codex-mcp-trial-install-" + cleanup_context["run_id"].replace("-", "")
+        if (engine.inspect_container_name(regression_container_name) is not None
+                or cleanup_context["port"].read_creation_record(
+                    cleanup_context["run_id"], "installer") is not None):
+            raise TrialFailure("READBACK_REGRESSION_CONTAINER_RESIDUAL")
+        _remove_auxiliary_volume(context=cleanup_context, engine=engine)
+        report["readback_cleanup_regression"]["resource_cleanup_verified"] = cleanup_context["removed"]
+        report["phases"][current_phase] = "PASS"
+
+        current_phase = "A_nocopy_positive_control"
+        report["phases"][current_phase] = "RUNNING"
+        nocopy_context = _auxiliary_cas_volume(root=temp_root, engine=engine,
+            LeaseRecord=LeaseRecord, SecureLeaseV2Store=SecureLeaseV2Store,
+            SecureDockerLeasePort=SecureDockerLeasePort, kernel_boot_id=boot,
+            contract_digest=source_digest, image_id=image, contexts=auxiliary_contexts)
+        report["nocopy_positive_control"] = engine.run_nocopy_positive_control(
+            run_id=nocopy_context["run_id"], volume=nocopy_context["volume"],
+            image_id=image, lease=nocopy_context["port"])
+        _remove_auxiliary_volume(context=nocopy_context, engine=engine)
+        report["nocopy_positive_control"]["resource_cleanup_verified"] = nocopy_context["removed"]
+        report["phases"][current_phase] = "PASS"
+
         current_phase = "A_volume_init_readback"
         report["phases"][current_phase] = "RUNNING"
         lifecycle.prepare_volume()
-        report["phases"][current_phase] = "PASS"
-        current_phase = "A_readback_failure_cleanup_regression"
-        report["phases"][current_phase] = "RUNNING"
-        report["readback_cleanup_regression"] = engine.run_real_readback_cleanup_regression(
-            run_id=run_id, volume=lifecycle.volume, image_id=image, lease=port)
         report["phases"][current_phase] = "PASS"
         current_phase = "B_offline_installer_import_cgroup"
         report["phases"][current_phase] = "RUNNING"
@@ -498,6 +698,16 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         return_code = 1
     finally:
         cleanup_ok = False
+        for context in reversed(auxiliary_contexts):
+            if context.get("removed"):
+                continue
+            try:
+                _cleanup_auxiliary_context(context=context, engine=engine,
+                    expected_base_digest=BASE_DIGEST)
+                context["cleanup_reconciled"] = True
+            except Exception as exc:
+                context["cleanup_reconciled"] = False
+                context["cleanup_error"] = getattr(exc, "code", "AUX_CLEANUP_UNCERTAIN")
         if lifecycle is not None:
             try:
                 lifecycle.cleanup()
@@ -558,6 +768,27 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
                     and (current is None or current.state == "STOPPED"))
             except Exception:
                 resources_absent = False
+        if engine is not None:
+            for context in auxiliary_contexts:
+                try:
+                    aux_record = context["store"].read()
+                    aux_resources = aux_record.docker_resources
+                    aux_clear = (
+                        engine.inspect_volume(context["volume"].name) is None
+                        and engine.inspect_container_name("codex-mcp-trial-install-" +
+                            context["run_id"].replace("-", "")) is None
+                        and aux_resources is not None and aux_resources.state == "STOPPED"
+                        and not (aux_resources.pins or {})
+                        and not (aux_resources.creations or {}))
+                    context["reconciliation_verified"] = bool(aux_clear)
+                    resources_absent = resources_absent and bool(aux_clear)
+                except Exception:
+                    context["reconciliation_verified"] = False
+                    resources_absent = False
+            report["auxiliary_resource_reconciliation"] = [
+                {"status":"PASS" if item.get("reconciliation_verified") else "UNCERTAIN",
+                 "removed":bool(item.get("removed"))}
+                for item in auxiliary_contexts]
         report["resource_absence_verified"] = bool(resources_absent)
         preserve_state = (not resources_absent or not cleanup_ok
             or report.get("cas") == "FINAL_READBACK_FAILED"
@@ -567,7 +798,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             result_dir = Path(os.environ.get("DOCKER_TRIAL_RESULTS", "/results"))
             try:
                 report["cas_recovery_copy_sha256"] = _preserve_cas_for_reconciliation(
-                    temp_root, result_dir)
+                    temp_root, result_dir, auxiliary_contexts)
                 report["controller_state_cleanup"] = "RETAINED_FOR_RECONCILIATION"
                 report["controller_state_path"] = "encrypted-report:cas-recovery"
             except Exception as exc:
@@ -591,7 +822,8 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         result_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="ascii")
         os.chmod(result_path, 0o600)
     print("DOCKER_TRIAL_STATUS=" + str(report["status"]))
-    for name in ("A_volume_init_readback", "A_readback_failure_cleanup_regression",
+    for name in ("A_readback_failure_cleanup_regression", "A_nocopy_positive_control",
+                 "A_volume_init_readback",
                  "B_offline_installer_import_cgroup",
                  "C_same_store_so_peercred_peer_pin", "D_full_runtime", "E_deadline_recovery"):
         print("DOCKER_TRIAL_{}={}".format(name, report.get("phases", {}).get(name, "NOT_REACHED")))
