@@ -24,6 +24,163 @@ if SOURCE_ROOT and os.path.isdir(SOURCE_ROOT):
 
 
 class RunnerDiagnosticsTests(unittest.TestCase):
+    def test_docker_gateway_readback_normalizes_only_observed_engine_defaults(self):
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
+                self.fail("PRIVATE_ENTRYPOINT_TEST_SOURCE_ROOT_MISSING")
+            self.skipTest("private archive is staged only in the Linux trial job")
+        from tools.document_nas_docker_engine_v141 import DockerEngineV141
+        from tools.document_nas_docker_named_volume_lifecycle import (
+            CAS_SOCKET_TARGET, ContainerSpec, VolumeSpec, container_readback_checks,
+            readback_checks_pass, restart_policy_matches,
+        )
+
+        run_id = "11111111-1111-4111-8111-111111111111"
+        image_id = "sha256:" + "c" * 64
+        volume = VolumeSpec.for_run(run_id)
+        socket_source = "/run/codex-mcp-lease/11111111111141118111111111111111/lease.sock"
+        spec = ContainerSpec.create(role="gateway", run_id=run_id, image_id=image_id,
+            memory_bytes=201326592, pids_limit=64, volume_name=volume.name,
+            cas_socket_host_path=socket_source)
+        cid = "a" * 64
+        image_labels = {"codex.mcp.base-image-digest":
+            "sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+            "codex.mcp.synthetic-tunnel":"true", "codex.mcp.trial-image-run":"45646177123"}
+        observed = {
+            "Id":cid, "Name":"/" + spec.name,
+            "Config":{"Image":image_id,"User":"61001:61001",
+                "Labels":{**image_labels,"codex.mcp.trial":"1","codex.mcp.run":run_id,
+                    "codex.mcp.role":"gateway"},
+                "Entrypoint":["python3","/opt/codex-mcp/bin/container-entrypoint.py"],
+                "Cmd":["gateway","--run-id",run_id,"--config",
+                    "/var/lib/codex-mcp/python/app/config/trial-gateway.json",
+                    "--credential-provider-factory",
+                    "docker_trial_container_entrypoint:synthetic_test_provider_factory"],
+                "Env":["PYTHONDONTWRITEBYTECODE=1","MCP_SYNTHETIC_TUNNEL=1",
+                    "MCP_SYNTHETIC_CREDENTIALS=1",
+                    "MCP_CAS_SOCKET_PATH=/run/codex-mcp-lease/lease.sock"]},
+            "HostConfig":{"NetworkMode":"none","Privileged":False,"CapAdd":[],
+                "CapDrop":["ALL"],"ReadonlyRootfs":True,
+                "SecurityOpt":["no-new-privileges:true"],"Memory":201326592,
+                "MemorySwap":201326592,"PidsLimit":64,
+                "RestartPolicy":{"Name":"no","MaximumRetryCount":0},
+                "Binds":[],"Devices":[],"PortBindings":{},"PidMode":"",
+                "Mounts":[
+                    {"Type":"volume","Source":volume.name,"Target":"/var/lib/codex-mcp",
+                        "ReadOnly":False,"VolumeOptions":{"NoCopy":True}},
+                    {"Type":"bind","Source":socket_source,
+                        "Target":CAS_SOCKET_TARGET,"ReadOnly":True,
+                        "BindOptions":{"Propagation":"rprivate"}}]},
+            "Mounts":[
+                {"Type":"volume","Name":volume.name,
+                    "Source":"/var/lib/docker/volumes/"+volume.name+"/_data",
+                    "Destination":"/var/lib/codex-mcp","Driver":"local","Mode":"z",
+                    "RW":True,"Propagation":""},
+                {"Type":"bind","Source":socket_source,"Destination":CAS_SOCKET_TARGET,
+                    "Mode":"","RW":False,"Propagation":"rprivate"}],
+            "State":{"Status":"created","OOMKilled":False}}
+        mountpoint = observed["Mounts"][0]["Source"]
+        labels = {"codex.mcp.trial":"1","codex.mcp.run":run_id,"codex.mcp.role":"gateway"}
+        body = {"Image":image_id,"User":"61001:61001","Labels":labels,
+            "Entrypoint":observed["Config"]["Entrypoint"],"Cmd":observed["Config"]["Cmd"],
+            "Env":["PYTHONDONTWRITEBYTECODE=1","MCP_SYNTHETIC_TUNNEL=1",
+                "MCP_SYNTHETIC_CREDENTIALS=1",
+                "MCP_CAS_SOCKET_PATH=/run/codex-mcp-lease/lease.sock"],
+            "HostConfig":{"NetworkMode":"none","SecurityOpt":["no-new-privileges:true"],
+                "RestartPolicy":{"Name":"no"},
+                "Mounts":[
+                    {"Type":"volume","Source":volume.name,"Target":"/var/lib/codex-mcp",
+                        "ReadOnly":False,"VolumeOptions":{"NoCopy":True}},
+                    {"Type":"bind","Source":socket_source,
+                        "Target":CAS_SOCKET_TARGET,"ReadOnly":True,
+                        "BindOptions":{"Propagation":"rprivate"}}]}}
+
+        self.assertTrue(restart_policy_matches({"Name":"no"}))
+        self.assertTrue(restart_policy_matches({"Name":"no","MaximumRetryCount":0}))
+        for invalid in ({"Name":"no","MaximumRetryCount":1},
+                        {"Name":"always","MaximumRetryCount":0},
+                        {"Name":"no","Unexpected":0},
+                        {"Name":"no","MaximumRetryCount":False}):
+            self.assertFalse(restart_policy_matches(invalid), invalid)
+
+        for status in ("created", "running"):
+            observed["State"]["Status"] = status
+            checks = container_readback_checks(spec, observed, expected_state=status,
+                expected_container_id=cid, image_labels=image_labels,
+                expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+                volume_mountpoint=mountpoint)
+            self.assertTrue(readback_checks_pass(checks), checks)
+
+        observed["State"]["Status"] = "created"
+        ro_mode = json.loads(json.dumps(observed))
+        ro_mode["Mounts"][1]["Mode"] = "ro"
+        self.assertTrue(readback_checks_pass(container_readback_checks(spec, ro_mode,
+            expected_state="created", expected_container_id=cid, image_labels=image_labels,
+            expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+            volume_mountpoint=mountpoint)))
+
+        one_shot = DockerEngineV141._one_shot_readback_checks(spec.name, body, observed,
+            cid, image_id, 201326592, 64, [], image_labels=image_labels,
+            expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+            volume_mountpoint=mountpoint)
+        self.assertTrue(readback_checks_pass(one_shot), one_shot)
+        bad_one_shot = json.loads(json.dumps(observed))
+        bad_one_shot["HostConfig"]["RestartPolicy"]["MaximumRetryCount"] = 1
+        rejected = DockerEngineV141._one_shot_readback_checks(spec.name, body, bad_one_shot,
+            cid, image_id, 201326592, 64, [], image_labels=image_labels,
+            expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+            volume_mountpoint=mountpoint)
+        self.assertFalse(readback_checks_pass(rejected), rejected)
+
+        invalid_cases = []
+        bad = json.loads(json.dumps(observed)); bad["HostConfig"]["RestartPolicy"]["MaximumRetryCount"] = 1
+        invalid_cases.append(("restart_retry_count", bad))
+        bad = json.loads(json.dumps(observed)); bad["Mounts"][1]["RW"] = True
+        invalid_cases.append(("readonly_rw", bad))
+        bad = json.loads(json.dumps(observed)); bad["Mounts"][1]["Mode"] = "rw,shared"
+        invalid_cases.append(("readonly_mode", bad))
+        bad = json.loads(json.dumps(observed)); bad["Mounts"][1]["Source"] = "/run/foreign.sock"
+        invalid_cases.append(("bind_source", bad))
+        bad = json.loads(json.dumps(observed)); bad["Mounts"][1]["Destination"] = "/tmp/lease.sock"
+        invalid_cases.append(("bind_destination", bad))
+        bad = json.loads(json.dumps(observed)); bad["Mounts"][1]["Type"] = "volume"
+        invalid_cases.append(("bind_type", bad))
+        bad = json.loads(json.dumps(observed)); bad["Mounts"][1]["Propagation"] = "shared"
+        invalid_cases.append(("bind_propagation", bad))
+        for label, bad in invalid_cases:
+            with self.subTest(case=label):
+                checks = container_readback_checks(spec, bad, expected_state="created",
+                    expected_container_id=cid, image_labels=image_labels,
+                    expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+                    volume_mountpoint=mountpoint)
+                self.assertFalse(readback_checks_pass(checks), label)
+
+        tunnel_spec = ContainerSpec.create(role="tunnel", run_id=run_id,
+            image_id=image_id, memory_bytes=67108864, pids_limit=32,
+            gateway_id="d" * 64)
+        tunnel = json.loads(json.dumps(observed))
+        tunnel_id = "b" * 64
+        tunnel["Id"] = tunnel_id
+        tunnel["Name"] = "/" + tunnel_spec.name
+        tunnel["Config"]["Labels"]["codex.mcp.role"] = "tunnel"
+        tunnel["Config"]["Cmd"] = ["tunnel", "--run-id", run_id]
+        tunnel["Config"]["Env"] = ["PYTHONDONTWRITEBYTECODE=1",
+            "MCP_SYNTHETIC_TUNNEL=1", "MCP_SYNTHETIC_CREDENTIALS=1"]
+        tunnel["HostConfig"]["NetworkMode"] = tunnel_spec.network_mode
+        tunnel["HostConfig"]["Memory"] = tunnel_spec.memory_bytes
+        tunnel["HostConfig"]["MemorySwap"] = tunnel_spec.memory_swap_bytes
+        tunnel["HostConfig"]["PidsLimit"] = tunnel_spec.pids_limit
+        tunnel["HostConfig"]["Mounts"] = []
+        tunnel["Mounts"] = []
+        self.assertTrue(readback_checks_pass(container_readback_checks(tunnel_spec, tunnel,
+            expected_state="created", expected_container_id=tunnel_id,
+            image_labels=image_labels,
+            expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363")),
+            container_readback_checks(tunnel_spec, tunnel,
+                expected_state="created", expected_container_id=tunnel_id,
+                image_labels=image_labels,
+                expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363"))
+
     def test_only_sentinel_payload_failure_with_verified_cleanup_can_continue(self):
         class Failure(Exception):
             code = "NOCOPY_CONTROL_PAYLOAD_EXIT_NONZERO"

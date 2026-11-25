@@ -61,6 +61,7 @@ jobs:
             test_image_permissions \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_rpc_server_stops_before_socket_close_without_thread_exception \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_actual_adapter_sentinel_command_passes_real_entrypoint_parser \
+            test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_docker_gateway_readback_normalizes_only_observed_engine_defaults \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_entrypoint_argparse_failure_is_structured \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_nocopy_raw_payload_capture_is_private_bounded_and_exact \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_real_volume_initializer_transfers_ownership_without_post_transfer_path_walk \
