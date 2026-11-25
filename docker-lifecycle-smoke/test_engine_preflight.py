@@ -170,7 +170,8 @@ class DockerEnginePreflightTests(unittest.TestCase):
             self.skipTest("real Linux boot identity is required for this CAS regression")
         sys.path.insert(0, source_root)
         import docker_lifecycle_runner as runner
-        from tools.document_nas_local_service_lease_v2 import LeaseRecord, SecureLeaseV2Store
+        from tools.document_nas_local_service_lease_v2 import (
+            LeaseRecord, SecureLeaseV2Store, _kernel_boot_id)
         from tools.document_nas_docker_lease_port import SecureDockerLeasePort
         with tempfile.TemporaryDirectory(prefix="real-cas-expiry-") as temp:
             root = Path(temp)
@@ -178,7 +179,7 @@ class DockerEnginePreflightTests(unittest.TestCase):
             result = runner._run_real_cas_expiry_regression(root=root,
                 LeaseRecord=LeaseRecord, SecureLeaseV2Store=SecureLeaseV2Store,
                 SecureDockerLeasePort=SecureDockerLeasePort,
-                boot_id=runner._kernel_boot_id(), contract_digest="c" * 64,
+                boot_id=_kernel_boot_id(), contract_digest="c" * 64,
                 image_id="sha256:" + "d" * 64)
             self.assertEqual(result.get("status"), "PASS")
             self.assertIs(result.get("run_deadline_elapsed"), True)
@@ -193,7 +194,8 @@ class DockerEnginePreflightTests(unittest.TestCase):
             self.skipTest("real Linux boot identity is required for this CAS regression")
         sys.path.insert(0, source_root)
         import docker_lifecycle_runner as runner
-        from tools.document_nas_local_service_lease_v2 import LeaseRecord, SecureLeaseV2Store
+        from tools.document_nas_local_service_lease_v2 import (
+            LeaseRecord, SecureLeaseV2Store, _kernel_boot_id)
         from tools.document_nas_docker_lease_port import SecureDockerLeasePort
         with tempfile.TemporaryDirectory(prefix="active-cas-expiry-") as temp:
             root = Path(temp)
@@ -201,7 +203,7 @@ class DockerEnginePreflightTests(unittest.TestCase):
             result = runner._run_active_cas_deadline_boundary(root=root,
                 LeaseRecord=LeaseRecord, SecureLeaseV2Store=SecureLeaseV2Store,
                 SecureDockerLeasePort=SecureDockerLeasePort,
-                boot_id=runner._kernel_boot_id(), contract_digest="e" * 64,
+                boot_id=_kernel_boot_id(), contract_digest="e" * 64,
                 image_id="sha256:" + "f" * 64)
             self.assertEqual(result.get("status"), "PASS")
             self.assertEqual(result.get("cas_state_before"), "ACTIVE")
