@@ -13,6 +13,8 @@ concurrency:
 jobs:
   trial:
     runs-on: ubuntu-24.04
+    environment:
+      name: codex-docker-trial-secrets-20261125
     timeout-minutes: 25
     env:
       DOCKER_HOST: unix:///var/run/docker.sock
