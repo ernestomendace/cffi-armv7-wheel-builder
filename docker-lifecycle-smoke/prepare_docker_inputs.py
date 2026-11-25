@@ -13,8 +13,8 @@ import tarfile
 import urllib.parse
 import urllib.request
 
-SOURCE_SHA256 = "c6e5c90d1aeee613a8d6f2500f923136b2ffb063a1ba3599eb88e4dd302963ec"
-SOURCE_BYTES = 96414
+SOURCE_SHA256 = "55c846474a1e1d40d8ba7cc64573ea0ea4f63ab2b1fa91d99ee2a1a17552edff"
+SOURCE_BYTES = 103154
 SOURCE_FILES = 23
 PARTS = 4
 MAX_PART = 40000

@@ -2,6 +2,7 @@ import os
 import hashlib
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +13,18 @@ from docker_lifecycle_runner import (
 
 
 class DockerEnginePreflightTests(unittest.TestCase):
+    def test_private_source_lock_matches_loader_and_runner_reaches_real_regression(self):
+        root = Path(__file__).resolve().parent
+        lock = json.loads((root / "docker-lifecycle-lock.json").read_text(encoding="ascii"))
+        private = lock["private_source"]
+        import prepare_docker_inputs
+        self.assertEqual(private["archive_sha256"], prepare_docker_inputs.SOURCE_SHA256)
+        self.assertEqual(private["archive_bytes"], prepare_docker_inputs.SOURCE_BYTES)
+        self.assertEqual(private["file_count"], prepare_docker_inputs.SOURCE_FILES)
+        source = (root / "docker_lifecycle_runner.py").read_text(encoding="utf-8")
+        self.assertIn("run_real_readback_cleanup_regression", source)
+        self.assertIn("A_readback_failure_cleanup_regression", source)
+
     def test_pinned_cli_endpoint_is_the_adapter_endpoint(self):
         with mock.patch.dict(os.environ, {"DOCKER_HOST": "unix:///var/run/docker.sock",
                 "DOCKER_CONTEXT": ""}, clear=False):

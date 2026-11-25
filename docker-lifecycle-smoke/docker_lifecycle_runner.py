@@ -455,6 +455,11 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         report["phases"][current_phase] = "RUNNING"
         lifecycle.prepare_volume()
         report["phases"][current_phase] = "PASS"
+        current_phase = "A_readback_failure_cleanup_regression"
+        report["phases"][current_phase] = "RUNNING"
+        report["readback_cleanup_regression"] = engine.run_real_readback_cleanup_regression(
+            run_id=run_id, volume=lifecycle.volume, image_id=image, lease=port)
+        report["phases"][current_phase] = "PASS"
         current_phase = "B_offline_installer_import_cgroup"
         report["phases"][current_phase] = "RUNNING"
         lifecycle.install_offline_bundle(dependency_archive.read_bytes(), sha256=dependency_sha,
@@ -511,6 +516,9 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
                 resources = final.docker_resources
                 report["cas"] = {"phase": final.phase, "resource_state": resources.state if resources else None,
                     "pinned_roles": sorted((resources.pins or {}).keys()) if resources else [],
+                    "creation_records": ({role:{"state":item.get("state"),
+                        "resource_id":item.get("resource_id"), "name":item.get("name")}
+                        for role, item in (resources.creations or {}).items()} if resources else {}),
                     "intent_present": bool(resources and resources.intent)}
             except Exception as exc:
                 report["cas"] = "FINAL_READBACK_FAILED"
@@ -539,13 +547,14 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             try:
                 current = final.docker_resources
                 no_pins = current is None or not (current.pins or {})
+                no_creation_records = current is None or not (current.creations or {})
                 no_resources = (engine.inspect_volume(lifecycle.volume.name) is None
                     and all(engine.inspect_container(cid) is None for cid in lifecycle.ids.values())
                     and port.read_volume_pin(run_id) is None
                     and port.read_initializer_pin(run_id) is None
                     and port.read_installer_pin(run_id) is None
                     and all(port.read_pin(run_id, role) is None for role in ("gateway", "tunnel")))
-                resources_absent = bool(no_pins and no_resources
+                resources_absent = bool(no_pins and no_creation_records and no_resources
                     and (current is None or current.state == "STOPPED"))
             except Exception:
                 resources_absent = False
@@ -582,7 +591,8 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         result_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="ascii")
         os.chmod(result_path, 0o600)
     print("DOCKER_TRIAL_STATUS=" + str(report["status"]))
-    for name in ("A_volume_init_readback", "B_offline_installer_import_cgroup",
+    for name in ("A_volume_init_readback", "A_readback_failure_cleanup_regression",
+                 "B_offline_installer_import_cgroup",
                  "C_same_store_so_peercred_peer_pin", "D_full_runtime", "E_deadline_recovery"):
         print("DOCKER_TRIAL_{}={}".format(name, report.get("phases", {}).get(name, "NOT_REACHED")))
     return return_code
