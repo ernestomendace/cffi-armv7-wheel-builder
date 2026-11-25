@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -25,6 +26,34 @@ class TrialFailure(RuntimeError):
     def __init__(self, code):
         super().__init__(code)
         self.code = code
+
+
+def _safe_exception_details(exc, phase):
+    """Bound diagnostics to exception type/errno and source locations only."""
+    return {"phase": phase, "exception_class": type(exc).__name__[:80],
+        "errno": exc.errno if isinstance(exc, OSError) and type(exc.errno) is int else None,
+        "stack": [{"file": os.path.basename(frame.filename)[:80],
+                   "line": int(frame.lineno), "function": frame.name[:80]}
+                  for frame in traceback.extract_tb(exc.__traceback__, limit=12)]}
+
+
+def _mark_phase_failed(report, phase):
+    phases = report.get("phases")
+    if isinstance(phases, dict) and phases.get(phase) == "RUNNING":
+        phases[phase] = "FAIL"
+
+
+def _shutdown_rpc(rpc, thread, *, stop_timeout=2.0, escalation_timeout=1.0):
+    """Stop and join before closing; close is a bounded escalation only."""
+    rpc.stop()
+    if thread is not None:
+        thread.join(timeout=stop_timeout)
+        if thread.is_alive():
+            rpc.close()
+            thread.join(timeout=escalation_timeout)
+        if thread.is_alive():
+            raise TrialFailure("RPC_THREAD_DID_NOT_TERMINATE")
+    rpc.close()
 
 
 def _proc_ticks(pid):
@@ -525,6 +554,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
     socket_root_created = False
     rpc = None
     rpc_thread = None
+    rpc_thread_errors = []
     lifecycle = None
     engine = None
     store = None
@@ -612,13 +642,6 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
                 and config.get("Image") == image)
             initial["process_identity_verified"] = bool(identity_ok)
             return bool(identity_ok)
-        rpc = DockerLeaseRPCServer(str(socket_path), port, peer_uid=61001,
-            peer_gid=61001, peer_executable="/usr/local/bin/python3.9",
-            application_only=True, application_run_id=run_id,
-            application_peer_verifier=verify_peer).bind()
-        rpc_thread = threading.Thread(target=rpc.serve_forever, daemon=True)
-        rpc_thread.start()
-
         lifecycle = NamedVolumeTrialLifecycle(engine=engine, lease=port, run_id=run_id,
             gateway_image_id=image, tunnel_image_id=image,
             expected_platform=("linux", "amd64", ""), expected_base_digest=BASE_DIGEST,
@@ -668,13 +691,29 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         holder["lifecycle"] = lifecycle
         current_phase = "C_same_store_so_peercred_peer_pin"
         report["phases"][current_phase] = "RUNNING"
+        # Bind and start the RPC only when phase C is ready to launch the gateway.
+        rpc = DockerLeaseRPCServer(str(socket_path), port, peer_uid=61001,
+            peer_gid=61001, peer_executable="/usr/local/bin/python3.9",
+            application_only=True, application_run_id=run_id,
+            application_peer_verifier=verify_peer).bind()
+        def serve_rpc():
+            try:
+                rpc.serve_forever()
+            except Exception as exc:
+                rpc_thread_errors.append(_safe_exception_details(exc, "rpc_serve"))
+        rpc_thread = threading.Thread(target=serve_rpc, daemon=True,
+                                     name="docker-trial-lease-rpc")
+        rpc_thread.start()
         lifecycle.start_gateway()
         deadline = time.monotonic() + 20
-        while time.monotonic() < deadline and rpc.application_success_count < 1:
+        while (time.monotonic() < deadline and rpc.application_success_count < 1
+                and not rpc_thread_errors):
             running = engine.inspect_container(lifecycle.ids["gateway"])
             if not isinstance(running, dict) or running.get("State", {}).get("Status") != "running":
                 raise TrialFailure("GATEWAY_EXITED_BEFORE_CAS_READ")
             time.sleep(0.1)
+        if rpc_thread_errors:
+            raise TrialFailure("RPC_SERVER_TERMINATED_BEFORE_CAS_READ")
         if rpc.application_success_count < 1 or rpc.application_last_operation != "read_state":
             raise TrialFailure("APPLICATION_CAS_READ_NOT_OBSERVED")
         report["phases"][current_phase] = "PASS"
@@ -690,9 +729,12 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         report["status"] = "FAIL"
         report["primary_error"] = code if re.fullmatch(r"[A-Z0-9_]+", str(code)) else "DOCKER_TRIAL_UNEXPECTED"
         report["failed_phase"] = current_phase
+        _mark_phase_failed(report, current_phase)
+        details = _safe_exception_details(exc, current_phase)
         diagnostics = getattr(exc, "diagnostics", None)
         if isinstance(diagnostics, dict):
-            report["primary_error_diagnostics"] = diagnostics
+            details.update(diagnostics)
+        report["primary_error_diagnostics"] = details
         if engine is not None and engine.last_peer_diagnostic is not None:
             report["engine_peer_diagnostic"] = engine.last_peer_diagnostic
         return_code = 1
@@ -734,10 +776,20 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
                 report["cas"] = "FINAL_READBACK_FAILED"
                 report["cas_readback_error"] = getattr(exc, "code", "CAS_FINAL_READBACK_FAILED")
         if rpc is not None:
-            rpc.stop()
-            rpc.close()
-        if rpc_thread is not None:
-            rpc_thread.join(timeout=2)
+            try:
+                _shutdown_rpc(rpc, rpc_thread)
+                report["rpc_shutdown"] = "PASS"
+            except Exception as exc:
+                report["rpc_shutdown"] = "FAIL"
+                report["rpc_shutdown_error"] = _safe_exception_details(exc, "rpc_shutdown")
+                if report.get("status") == "PASS_A_B_C":
+                    report["status"] = "FAIL_CLEANUP"
+                    return_code = 1
+            if rpc_thread_errors:
+                report["rpc_thread_error"] = rpc_thread_errors[:4]
+                report["rpc_shutdown"] = "FAIL"
+                report["status"] = "FAIL_CLEANUP"
+                return_code = 1
         if run_dir is not None:
             try:
                 run_dir.rmdir()
@@ -811,7 +863,8 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
                 report["controller_state_cleanup"] = "FAIL"
             else:
                 report["controller_state_cleanup"] = "PASS"
-        if (report.get("cleanup") == "FAIL" or report.get("socket_cleanup") == "FAIL"
+        if (report.get("cleanup") == "FAIL" or report.get("rpc_shutdown") == "FAIL"
+                or report.get("socket_cleanup") == "FAIL"
                 or report.get("controller_state_cleanup") in {"FAIL", "PRESERVATION_FAILED"}
                 or not resources_absent):
             report["status"] = "FAIL_CLEANUP"
@@ -850,7 +903,8 @@ def main():
             result_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             target = result_dir / "docker-trial-report.json"
             target.write_text(json.dumps({"schema":1, "status":"FAIL",
-                "failed_phase":"controller_preflight", "primary_error":safe_code},
+                "failed_phase":"controller_preflight", "primary_error":safe_code,
+                "primary_error_diagnostics":_safe_exception_details(exc, "controller_preflight")},
                 sort_keys=True) + "\n", encoding="ascii")
             os.chmod(target, 0o600)
         except OSError:

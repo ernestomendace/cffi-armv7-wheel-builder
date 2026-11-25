@@ -45,9 +45,22 @@ jobs:
           python3 -B docker-lifecycle-smoke/prepare_docker_inputs.py \
             --root "$RUNNER_TEMP/docker-trial-inputs"
 
+      - name: Verify production RPC orderly shutdown on Linux
+        id: rpc_test
+        if: steps.prepare.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          DOCKER_TRIAL_SOURCE_ROOT: ${{ runner.temp }}/docker-trial-inputs/source/application
+        run: |
+          set -euo pipefail
+          PYTHONPATH="docker-lifecycle-smoke:$DOCKER_TRIAL_SOURCE_ROOT" \
+            python3 -B -m unittest \
+            test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_rpc_server_stops_before_socket_close_without_thread_exception
+
       - name: Build unprivileged private test image by base digest
         id: image
-        if: steps.prepare.outcome == 'success'
+        if: steps.prepare.outcome == 'success' && steps.rpc_test.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
@@ -143,10 +156,11 @@ jobs:
           TRIAL_OUTCOME: ${{ steps.trial.outcome }}
           IMAGE_CLEANUP_OUTCOME: ${{ steps.image_cleanup.outcome }}
           ENCRYPT_OUTCOME: ${{ steps.encrypt.outcome }}
+          RPC_TEST_OUTCOME: ${{ steps.rpc_test.outcome }}
         run: |
-          printf 'Input preparation: %s\nImage build: %s\nReal Docker/CAS trial: %s\nImage cleanup: %s\nEncrypted diagnostics: %s\n' \
-            "$PREPARE_OUTCOME" "$IMAGE_OUTCOME" "$TRIAL_OUTCOME" "$IMAGE_CLEANUP_OUTCOME" "$ENCRYPT_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$PREPARE_OUTCOME" != success || "$IMAGE_OUTCOME" != success || \
+          printf 'Input preparation: %s\nLinux RPC regression: %s\nImage build: %s\nReal Docker/CAS trial: %s\nImage cleanup: %s\nEncrypted diagnostics: %s\n' \
+            "$PREPARE_OUTCOME" "$RPC_TEST_OUTCOME" "$IMAGE_OUTCOME" "$TRIAL_OUTCOME" "$IMAGE_CLEANUP_OUTCOME" "$ENCRYPT_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$PREPARE_OUTCOME" != success || "$RPC_TEST_OUTCOME" != success || "$IMAGE_OUTCOME" != success || \
                 "$TRIAL_OUTCOME" != success || "$IMAGE_CLEANUP_OUTCOME" != success || \
                 "$ENCRYPT_OUTCOME" != success ]]; then
             exit 1
