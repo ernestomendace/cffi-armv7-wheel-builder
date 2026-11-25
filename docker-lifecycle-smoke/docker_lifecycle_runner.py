@@ -43,6 +43,37 @@ def _mark_phase_failed(report, phase):
         phases[phase] = "FAIL"
 
 
+def _nocopy_failure_is_payload_only(exc):
+    """Allow only a verified sentinel-payload defect to proceed to independent A-C."""
+    diagnostics = getattr(exc, "diagnostics", None)
+    if (getattr(exc, "code", None) != "NOCOPY_CONTROL_PAYLOAD_EXIT_NONZERO"
+            or not isinstance(diagnostics, dict)):
+        return None
+    stages = diagnostics.get("stages")
+    cleanup = diagnostics.get("cleanup")
+    container = diagnostics.get("container_diagnostic")
+    allowed_codes = {"NOCOPY_CONTROL_SENTINEL_CONTENT_INVALID",
+                     "NOCOPY_CONTROL_SENTINEL_IDENTITY_INVALID"}
+    if (not isinstance(stages, dict)
+            or stages.get("image_sentinel_preflight") != "PASS"
+            or any(stages.get(key) != "PASS" for key in
+                   ("create", "create_readback", "pin", "start"))
+            or stages.get("sentinel_verify") != "FAIL"
+            or not isinstance(cleanup, dict) or cleanup.get("status") != "PASS"
+            or cleanup.get("container_absent") is not True
+            or cleanup.get("pin_absent") is not True
+            or cleanup.get("creation_absent") is not True
+            or not isinstance(container, dict) or container.get("status") != "PASS"
+            or container.get("exit_code") != 2 or container.get("oom_killed") is not False
+            or container.get("application_code") not in allowed_codes
+            or container.get("application_phase") != "nocopy-positive-control"):
+        return None
+    return {"code":container["application_code"],
+            "phase":container["application_phase"], "exit_code":2,
+            "pre_mount_image_sentinel":"PASS", "creation_and_pin":"PASS",
+            "cleanup":"PASS"}
+
+
 def _locked_source_digest():
     """Read the private source archive digest from the checked-in lock."""
     lock_path = Path(__file__).resolve().parent / "docker-lifecycle-lock.json"
@@ -446,6 +477,10 @@ def _cleanup_auxiliary_context(*, context, engine, expected_base_digest):
             state = actual.get("State", {}).get("Status") if isinstance(actual, dict) else None
         if state not in ("created", "exited", "dead"):
             raise TrialFailure("AUX_CONTAINER_STATE_UNCERTAIN")
+        collector = getattr(engine, "collect_container_diagnostics", None)
+        if callable(collector):
+            collector(cid, run_id=run_id, role="installer",
+                expected_name=name, image_id=context["image_id"])
         engine.remove_container(cid)
         if engine.inspect_container(cid) is not None or engine.inspect_container_name(name) is not None:
             raise TrialFailure("AUX_CONTAINER_REMOVE_READBACK_FAILED")
@@ -686,12 +721,26 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             LeaseRecord=LeaseRecord, SecureLeaseV2Store=SecureLeaseV2Store,
             SecureDockerLeasePort=SecureDockerLeasePort, kernel_boot_id=boot,
             contract_digest=source_digest, image_id=image, contexts=auxiliary_contexts)
-        report["nocopy_positive_control"] = engine.run_nocopy_positive_control(
-            run_id=nocopy_context["run_id"], volume=nocopy_context["volume"],
-            image_id=image, lease=nocopy_context["port"])
-        _remove_auxiliary_volume(context=nocopy_context, engine=engine)
-        report["nocopy_positive_control"]["resource_cleanup_verified"] = nocopy_context["removed"]
-        report["phases"][current_phase] = "PASS"
+        try:
+            report["nocopy_positive_control"] = engine.run_nocopy_positive_control(
+                run_id=nocopy_context["run_id"], volume=nocopy_context["volume"],
+                image_id=image, lease=nocopy_context["port"])
+        except Exception as exc:
+            payload_failure = _nocopy_failure_is_payload_only(exc)
+            if payload_failure is None:
+                raise
+            report["nocopy_positive_control"] = {"status":"FAIL_DIAGNOSTIC_ONLY",
+                "isolated_failure":payload_failure}
+            report["failed_phase"] = current_phase
+            report["phases"][current_phase] = "FAIL_DIAGNOSTIC_ONLY"
+            _remove_auxiliary_volume(context=nocopy_context, engine=engine)
+            report["nocopy_positive_control"]["resource_cleanup_verified"] = nocopy_context["removed"]
+            if not nocopy_context["removed"]:
+                raise TrialFailure("NOCOPY_AUXILIARY_CLEANUP_UNVERIFIED")
+        else:
+            _remove_auxiliary_volume(context=nocopy_context, engine=engine)
+            report["nocopy_positive_control"]["resource_cleanup_verified"] = nocopy_context["removed"]
+            report["phases"][current_phase] = "PASS"
 
         current_phase = "A_volume_init_readback"
         report["phases"][current_phase] = "RUNNING"
@@ -736,8 +785,12 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         report["application_rpc_count"] = rpc.application_success_count
         report["phases"]["D_full_runtime"] = "NOT_EXECUTED"
         report["phases"]["E_deadline_recovery"] = "NOT_EXECUTED"
-        report["status"] = "PASS_A_B_C"
-        return_code = 0
+        if report["phases"].get("A_nocopy_positive_control") == "FAIL_DIAGNOSTIC_ONLY":
+            report["status"] = "PARTIAL_A_B_C_NOCOPY_DIAGNOSTIC_FAILURE"
+            return_code = 1
+        else:
+            report["status"] = "PASS_A_B_C"
+            return_code = 0
     except Exception as exc:
         code = getattr(exc, "code", "DOCKER_TRIAL_UNEXPECTED")
         report["status"] = "FAIL"
@@ -772,6 +825,9 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
             except Exception as exc:
                 report["cleanup"] = "FAIL"
                 report["cleanup_error"] = getattr(exc, "code", "CLEANUP_UNCERTAIN")
+        if engine is not None:
+            report["container_diagnostics"] = list(
+                getattr(engine, "container_diagnostics", [])[-32:])
         elif port is not None:
             report["cleanup"] = "NO_DOCKER_MUTATION"
             cleanup_ok = True

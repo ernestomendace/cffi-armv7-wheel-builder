@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from docker_lifecycle_runner import (
-    _mark_phase_failed, _safe_exception_details, _shutdown_rpc,
+    _mark_phase_failed, _nocopy_failure_is_payload_only, _safe_exception_details, _shutdown_rpc,
 )
 
 SOURCE_ROOT = os.environ.get("DOCKER_TRIAL_SOURCE_ROOT")
@@ -19,6 +19,56 @@ if SOURCE_ROOT and os.path.isdir(SOURCE_ROOT):
 
 
 class RunnerDiagnosticsTests(unittest.TestCase):
+    def test_only_sentinel_payload_failure_with_verified_cleanup_can_continue(self):
+        class Failure(Exception):
+            code = "NOCOPY_CONTROL_PAYLOAD_EXIT_NONZERO"
+            diagnostics = {"stages":{"image_sentinel_preflight":"PASS", "create":"PASS",
+                "create_readback":"PASS", "pin":"PASS", "start":"PASS",
+                "sentinel_verify":"FAIL"},
+                "cleanup":{"status":"PASS","container_absent":True,
+                    "pin_absent":True,"creation_absent":True},
+                "container_diagnostic":{"status":"PASS","exit_code":2,"oom_killed":False,
+                    "application_code":"NOCOPY_CONTROL_SENTINEL_CONTENT_INVALID",
+                    "application_phase":"nocopy-positive-control"}}
+        result = _nocopy_failure_is_payload_only(Failure())
+        self.assertEqual(result["code"], "NOCOPY_CONTROL_SENTINEL_CONTENT_INVALID")
+        for key, value in (("container_absent",False), ("pin_absent",False),
+                           ("creation_absent",False)):
+            bad = Failure()
+            bad.diagnostics["cleanup"][key] = value
+            self.assertIsNone(_nocopy_failure_is_payload_only(bad))
+            bad.diagnostics["cleanup"][key] = True
+        bad = Failure()
+        bad.diagnostics["container_diagnostic"]["application_code"] = "NOCOPY_CONTROL_VOLUME_MISSING"
+        self.assertIsNone(_nocopy_failure_is_payload_only(bad))
+        bad = Failure()
+        bad.diagnostics["container_diagnostic"]["oom_killed"] = True
+        self.assertIsNone(_nocopy_failure_is_payload_only(bad))
+
+    def test_sentinel_diagnostic_continuation_rejects_incomplete_common_protections(self):
+        class Failure(Exception):
+            code = "NOCOPY_CONTROL_PAYLOAD_EXIT_NONZERO"
+            diagnostics = {"stages":{"image_sentinel_preflight":"PASS", "create":"PASS",
+                "create_readback":"PASS", "pin":"PASS", "start":"PASS",
+                "sentinel_verify":"FAIL"},
+                "cleanup":{"status":"PASS","container_absent":True,
+                    "pin_absent":True,"creation_absent":True},
+                "container_diagnostic":{"status":"PASS","exit_code":2,"oom_killed":False,
+                    "application_code":"NOCOPY_CONTROL_SENTINEL_IDENTITY_INVALID",
+                    "application_phase":"nocopy-positive-control"}}
+        for stage in ("image_sentinel_preflight", "create", "create_readback", "pin", "start"):
+            bad = Failure()
+            bad.diagnostics = {key: dict(value) for key, value in Failure.diagnostics.items()}
+            bad.diagnostics["stages"][stage] = "FAIL"
+            self.assertIsNone(_nocopy_failure_is_payload_only(bad), stage)
+        for field, value in (("status", "UNAVAILABLE"), ("exit_code", 0),
+                             ("oom_killed", None), ("application_phase", "install"),
+                             ("application_code", "ARGUMENTS_INVALID")):
+            bad = Failure()
+            bad.diagnostics = {key: dict(item) for key, item in Failure.diagnostics.items()}
+            bad.diagnostics["container_diagnostic"][field] = value
+            self.assertIsNone(_nocopy_failure_is_payload_only(bad), field)
+
     def test_unexpected_oserror_is_structured_bounded_and_sanitized(self):
         try:
             raise OSError(errno.EBADF, "private socket path and payload")
