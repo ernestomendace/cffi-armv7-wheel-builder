@@ -52,6 +52,7 @@ jobs:
         shell: bash
         env:
           DOCKER_TRIAL_SOURCE_ROOT: ${{ runner.temp }}/docker-trial-inputs/source/application
+          DOCKER_TRIAL_REQUIRE_REAL_RPC_TEST: "1"
         run: |
           set -euo pipefail
           PYTHONPATH="docker-lifecycle-smoke:$DOCKER_TRIAL_SOURCE_ROOT" \
@@ -82,7 +83,6 @@ jobs:
         shell: bash
         env:
           MCP_DOCKER_SOURCE_ARCHIVE: ${{ runner.temp }}/docker-trial-inputs/application-source.tar.gz
-          MCP_DOCKER_SOURCE_SHA256: f58c17d31cd2fbb2a64ca61210f13696661d0ed5ab2ca5d2230f2dc8e2880568
           DOCKER_TRIAL_RESULTS: ${{ runner.temp }}/docker-trial-results
           PYTHONDONTWRITEBYTECODE: "1"
         run: |

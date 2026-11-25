@@ -43,6 +43,20 @@ def _mark_phase_failed(report, phase):
         phases[phase] = "FAIL"
 
 
+def _locked_source_digest():
+    """Read the private source archive digest from the checked-in lock."""
+    lock_path = Path(__file__).resolve().parent / "docker-lifecycle-lock.json"
+    try:
+        lock = json.loads(lock_path.read_text(encoding="ascii"))
+        source = lock["private_source"]
+        digest = source["archive_sha256"]
+    except (OSError, ValueError, KeyError, TypeError):
+        raise TrialFailure("SOURCE_LOCK_UNREADABLE")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise TrialFailure("SOURCE_LOCK_DIGEST_INVALID")
+    return digest
+
+
 def _shutdown_rpc(rpc, thread, *, stop_timeout=2.0, escalation_timeout=1.0):
     """Stop and join before closing; close is a bounded escalation only."""
     rpc.stop()
@@ -528,7 +542,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
     source_root = source_root.resolve(strict=True)
     dependency_archive = dependency_archive.resolve(strict=True)
     source_archive = Path(os.environ["MCP_DOCKER_SOURCE_ARCHIVE"])
-    source_sha = os.environ["MCP_DOCKER_SOURCE_SHA256"]
+    source_sha = _locked_source_digest()
     if hashlib.sha256(source_archive.read_bytes()).hexdigest() != source_sha:
         raise TrialFailure("SOURCE_ARCHIVE_READBACK_MISMATCH")
     sys.path.insert(0, str(source_root))

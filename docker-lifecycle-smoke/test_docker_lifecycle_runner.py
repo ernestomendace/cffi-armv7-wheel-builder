@@ -1,5 +1,7 @@
 import errno
 import os
+import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -35,17 +37,37 @@ class RunnerDiagnosticsTests(unittest.TestCase):
         self.assertEqual(report["phases"]["A_nocopy_positive_control"], "FAIL")
 
     def test_rpc_server_stops_before_socket_close_without_thread_exception(self):
-        if not hasattr(__import__("socket"), "SO_PEERCRED"):
+        required = os.environ.get("DOCKER_TRIAL_REQUIRE_REAL_RPC_TEST") == "1"
+        if not hasattr(socket, "SO_PEERCRED"):
+            if required:
+                self.fail("RPC_REQUIRED_LINUX_SO_PEERCRED_UNAVAILABLE")
             self.skipTest("SO_PEERCRED and AF_UNIX lifecycle require Linux")
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if required:
+                self.fail("RPC_REQUIRED_PRIVATE_SOURCE_ROOT_MISSING")
+            self.skipTest("private source archive not enabled for this test invocation")
         try:
             from tools.document_nas_docker_lease_port import DockerLeaseRPCServer
-        except ImportError:
-            self.skipTest("private source archive not staged for this local test")
+        except ImportError as exc:
+            if required:
+                self.fail("RPC_REQUIRED_PRIVATE_IMPORT_FAILED:" + type(exc).__name__)
+            self.skipTest("private source archive not staged for this test invocation")
         with tempfile.TemporaryDirectory() as directory:
-            path = str(Path(directory) / "lease.sock")
+            parent = Path(directory) / "rpc-socket-parent"
+            parent.mkdir(mode=0o710)
+            os.chmod(str(parent), 0o710)
+            peer_uid = os.geteuid()
+            peer_gid = os.getegid()
+            parent_stat = os.lstat(str(parent))
+            self.assertTrue(stat.S_ISDIR(parent_stat.st_mode))
+            self.assertFalse(stat.S_ISLNK(parent_stat.st_mode))
+            self.assertEqual(parent_stat.st_uid, peer_uid)
+            self.assertEqual(parent_stat.st_gid, peer_gid)
+            self.assertEqual(stat.S_IMODE(parent_stat.st_mode), 0o710)
+            path = str(parent / "lease.sock")
             port = SimpleNamespace(run_id="11111111-1111-4111-8111-111111111111")
             server = DockerLeaseRPCServer(path, port,
-                peer_uid=max(1, os.geteuid()), peer_gid=os.getegid(),
+                peer_uid=max(1, peer_uid), peer_gid=peer_gid,
                 peer_executable="/usr/bin/python3").bind()
             errors = []
             def serve():

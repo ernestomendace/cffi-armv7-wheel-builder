@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from docker_lifecycle_runner import (
-    _docker_cli_socket, _engine_peer_proof, _listener_kernel_inode, _parse_proc_identity,
+    _docker_cli_socket, _engine_peer_proof, _listener_kernel_inode, _locked_source_digest, _parse_proc_identity,
     _preserve_cas_for_reconciliation, TrialFailure,
 )
 
@@ -18,6 +18,7 @@ class DockerEnginePreflightTests(unittest.TestCase):
         root = Path(__file__).resolve().parent
         lock = json.loads((root / "docker-lifecycle-lock.json").read_text(encoding="ascii"))
         private = lock["private_source"]
+        self.assertEqual(_locked_source_digest(), private["archive_sha256"])
         import prepare_docker_inputs
         self.assertEqual(private["archive_sha256"], prepare_docker_inputs.SOURCE_SHA256)
         self.assertEqual(private["archive_bytes"], prepare_docker_inputs.SOURCE_BYTES)
@@ -25,6 +26,20 @@ class DockerEnginePreflightTests(unittest.TestCase):
         source = (root / "docker_lifecycle_runner.py").read_text(encoding="utf-8")
         self.assertIn("run_real_readback_cleanup_regression", source)
         self.assertIn("A_readback_failure_cleanup_regression", source)
+
+    def test_workflow_has_no_duplicate_private_source_digest(self):
+        root = Path(__file__).resolve().parent
+        workflow = (root.parent / ".github" / "workflows" /
+                    "docker-lifecycle-smoke.yml").read_text(encoding="utf-8")
+        rpc_test = (root / "test_docker_lifecycle_runner.py").read_text(encoding="utf-8")
+        runner = (root / "docker_lifecycle_runner.py").read_text(encoding="utf-8")
+        self.assertNotIn("MCP_DOCKER_SOURCE_SHA256:", workflow)
+        self.assertIn('DOCKER_TRIAL_REQUIRE_REAL_RPC_TEST: "1"', workflow)
+        self.assertIn('self.fail("RPC_REQUIRED_PRIVATE_SOURCE_ROOT_MISSING")', rpc_test)
+        self.assertIn('self.fail("RPC_REQUIRED_PRIVATE_IMPORT_FAILED:"', rpc_test)
+        self.assertIn("_locked_source_digest()", runner)
+        self.assertIn('"archive_sha256"', runner)
+        self.assertIn('hashlib.sha256(source_archive.read_bytes()).hexdigest() != source_sha', runner)
 
     def test_pinned_cli_endpoint_is_the_adapter_endpoint(self):
         with mock.patch.dict(os.environ, {"DOCKER_HOST": "unix:///var/run/docker.sock",
