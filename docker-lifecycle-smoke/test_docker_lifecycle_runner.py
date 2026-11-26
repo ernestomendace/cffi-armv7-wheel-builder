@@ -25,6 +25,33 @@ if SOURCE_ROOT and os.path.isdir(SOURCE_ROOT):
 
 
 class RunnerDiagnosticsTests(unittest.TestCase):
+    def test_isolated_gateway_and_tunnel_import_paths_include_app_root(self):
+        if not SOURCE_ROOT or not Path(SOURCE_ROOT).is_dir():
+            if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
+                self.fail("PRIVATE_ENTRYPOINT_TEST_SOURCE_ROOT_MISSING")
+            self.skipTest("private archive is staged only in the Linux trial job")
+        from tools import docker_trial_container_entrypoint as entry
+        app_root = Path(SOURCE_ROOT)
+        tunnel_paths = entry._application_import_paths(
+            app_root, site_root=app_root / "python" / "site")
+        self.assertEqual(tunnel_paths[1:], [str(app_root), str(app_root / "src"),
+                                            str(app_root / "scripts")])
+        code = (entry.GATEWAY_CHILD_IMPORT_BOOTSTRAP +
+                "import scripts.validate_mcp_oauth_runtime_config; print('IMPORT_PATH_PASS')")
+        result = subprocess.run([sys.executable, "-I", "-c", code,
+            str(app_root / "src"), str(app_root / "scripts"), str(app_root)],
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr[-1200:])
+        self.assertIn("IMPORT_PATH_PASS", result.stdout)
+        old_code = ("import sys; app_src, scripts = sys.argv[1:3]; "
+                    "sys.path[:0] = [app_src, scripts]; "
+                    "import scripts.validate_mcp_oauth_runtime_config")
+        old = subprocess.run([sys.executable, "-I", "-c", old_code,
+            str(app_root / "src"), str(app_root / "scripts")],
+            capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(old.returncode, 0)
+        self.assertIn("No module named 'scripts'", old.stderr)
+
     def test_dead_controller_recovery_clears_creation_and_pin_atomically(self):
         required = os.environ.get("DOCKER_TRIAL_REQUIRE_REAL_RPC_TEST") == "1"
         if not os.path.isdir("/proc"):

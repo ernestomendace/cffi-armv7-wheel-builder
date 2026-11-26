@@ -88,6 +88,7 @@ jobs:
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_dead_controller_recovery_clears_creation_and_pin_atomically \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_actual_adapter_sentinel_command_passes_real_entrypoint_parser \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_docker_gateway_readback_normalizes_only_observed_engine_defaults \
+            test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_isolated_gateway_and_tunnel_import_paths_include_app_root \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_entrypoint_argparse_failure_is_structured \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_nocopy_raw_payload_capture_is_private_bounded_and_exact \
             test_docker_lifecycle_runner.RunnerDiagnosticsTests.test_real_volume_initializer_transfers_ownership_without_post_transfer_path_walk \
