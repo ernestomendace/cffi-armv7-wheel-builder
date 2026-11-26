@@ -749,6 +749,149 @@ def _preserve_cas_for_reconciliation(temp_root, result_dir, auxiliary_contexts=(
     return hashes
 
 
+def _reconcile_claimed_trial(store, engine, ready, *, boot_id, image_id, recovery_context):
+    """Remove only the resources bound to this run's cleanup-only claim."""
+    from tools.document_nas_local_service_lease_v2 import Phase, _kernel_boot_id
+    from tools.document_nas_docker_named_volume_lifecycle import (
+        VolumeSpec, stop_owned_container, validate_volume_readback,
+    )
+
+    run_id = ready["run_id"]
+    claimant_pid = os.getpid()
+    claimant_ticks = _proc_ticks(claimant_pid)
+    current = store.read()
+    resources = current.docker_resources
+    volume = VolumeSpec.for_run(run_id)
+    expected_roles = {"volume", "gateway", "tunnel"}
+    pins = resources.pins or {} if resources is not None else {}
+    creations = resources.creations or {} if resources is not None else {}
+    if (current.phase != Phase.UNCERTAIN.value or current.run_id != run_id
+            or current.boot_id != boot_id or _kernel_boot_id() != boot_id
+            or current.owner_role != "admin" or current.owner_pid != claimant_pid
+            or not claimant_ticks or current.owner_start_ticks != claimant_ticks
+            or resources is None or resources.state not in {"STOPPING", "STOPPED"}
+            or set(pins) != set(creations) or set(pins) - expected_roles
+            or resources.state == "STOPPED" and pins):
+        raise TrialFailure("RECOVERY_CLAIM_IDENTITY_UNVERIFIED")
+
+    actual = engine.inspect_volume(volume.name)
+    expected_pin = {"role":"volume", "resource_id":volume.name,
+        "image_id":"", "name":volume.name, "run_id":run_id,
+        "volume_name":volume.name, "driver":"local",
+        "labels":dict(volume.labels), "network_mode":""}
+    if "volume" in pins:
+        creation = creations["volume"]
+        if (pins["volume"] != expected_pin or creation.get("state") != "VERIFIED"
+                or any(creation.get(key) != value for key, value in expected_pin.items())
+                or actual is not None and (not isinstance(actual, dict)
+                    or not validate_volume_readback(volume, actual))):
+            raise TrialFailure("RECOVERY_VOLUME_OWNERSHIP_UNVERIFIED")
+    elif actual is not None or pins:
+        raise TrialFailure("RECOVERY_VOLUME_OWNERSHIP_UNVERIFIED")
+    if actual is not None:
+        mountpoint = actual.get("Mountpoint")
+        if not isinstance(mountpoint, str) or not mountpoint.startswith("/"):
+            raise TrialFailure("RECOVERY_VOLUME_MOUNTPOINT_INVALID")
+        recovery_context["volume_mountpoint_readback"] = "PASS"
+
+    def clear_role(role):
+        latest = store.read()
+        if store.docker_trial_recovery_cas(latest.sequence, run_id=run_id,
+                claimant_pid=claimant_pid, claimant_start_ticks=claimant_ticks,
+                now=time.monotonic(), clear_role=role, verified_absent=True) is not True:
+            raise TrialFailure("RECOVERY_CAS_CLEAR_FAILED")
+
+    for role in ("tunnel", "gateway"):
+        expected_id = ready.get(role + "_id")
+        expected_name = ready.get(role + "_name")
+        prefix = {"tunnel":"tu", "gateway":"gw"}[role]
+        if (not isinstance(expected_id, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_id)
+                or expected_name != "codex-mcp-trial-" + prefix + "-" + run_id.replace("-", "")):
+            raise TrialFailure("RECOVERY_READY_CONTAINER_IDENTITY_INVALID")
+        observed = engine.inspect_container(expected_id)
+        by_name = engine.inspect_container_name(expected_name)
+        if (observed is None) != (by_name is None) or (by_name is not None
+                and by_name.get("Id") != expected_id):
+            raise TrialFailure("RECOVERY_CONTAINER_NAME_UNVERIFIED")
+        if role not in pins:
+            if observed is not None:
+                raise TrialFailure("RECOVERY_CONTAINER_CAS_IDENTITY_INVALID")
+            continue
+        pin = pins[role]
+        creation = creations[role]
+        identity = {"resource_id":expected_id, "name":expected_name,
+            "run_id":run_id, "image_id":image_id, "role":role, "volume_name":volume.name}
+        if (creation.get("state") != "VERIFIED"
+                or any(pin.get(key) != value or creation.get(key) != value
+                    for key, value in identity.items())):
+            raise TrialFailure("RECOVERY_CONTAINER_CAS_IDENTITY_INVALID")
+        if observed is not None:
+            evidence = engine.inspect_image(image_id)
+            stopped = stop_owned_container(engine, creation, observed, 5,
+                image_labels=evidence.config_labels, expected_base_digest=BASE_DIGEST)
+            engine.collect_container_diagnostics(expected_id, run_id=run_id,
+                role=role, expected_name=expected_name, image_id=image_id)
+            recovery_context.setdefault(role + "_recovery", {})["exit_code"] = stopped["State"].get("ExitCode")
+            if engine.remove_container(expected_id) is not True:
+                raise TrialFailure("RECOVERY_CONTAINER_REMOVE_FAILED")
+        if (engine.inspect_container(expected_id) is not None
+                or engine.inspect_container_name(expected_name) is not None):
+            raise TrialFailure("RECOVERY_CONTAINER_ABSENCE_UNVERIFIED")
+        clear_role(role)
+        recovery_context.setdefault(role + "_recovery", {}).update(
+            {"status":"PASS", "container_absent":True})
+
+    if actual is not None:
+        refreshed = engine.inspect_volume(volume.name)
+        if not isinstance(refreshed, dict) or not validate_volume_readback(volume, refreshed):
+            raise TrialFailure("RECOVERY_VOLUME_OWNERSHIP_UNVERIFIED")
+        if engine.remove_volume(volume.name) is not True:
+            raise TrialFailure("RECOVERY_VOLUME_REMOVE_FAILED")
+    if engine.inspect_volume(volume.name) is not None:
+        raise TrialFailure("RECOVERY_VOLUME_ABSENCE_UNVERIFIED")
+    if "volume" in pins:
+        clear_role("volume")
+    current = store.read()
+    if current.docker_resources.state != "STOPPED":
+        if store.docker_trial_recovery_cas(current.sequence, run_id=run_id,
+                claimant_pid=claimant_pid, claimant_start_ticks=claimant_ticks,
+                now=time.monotonic(), state="STOPPED") is not True:
+            raise TrialFailure("RECOVERY_CAS_STOPPED_FAILED")
+    final = store.read()
+    final_resources = final.docker_resources
+    if (engine.inspect_volume(volume.name) is not None or final.phase != Phase.UNCERTAIN.value
+            or final_resources is None or final_resources.state != "STOPPED"
+            or final_resources.pins or final_resources.creations or final_resources.intent is None):
+        raise TrialFailure("RECOVERY_FINAL_RECONCILIATION_FAILED")
+    recovery_context["volume_absent"] = True
+    socket_dir = SOCKET_ROOT / run_id.replace("-", "")
+    if ready.get("socket_dir") != str(socket_dir):
+        raise TrialFailure("RECOVERY_SOCKET_DIRECTORY_IDENTITY_INVALID")
+    try:
+        directory = socket_dir.lstat()
+    except FileNotFoundError:
+        directory = None
+    if directory is not None:
+        parent = SOCKET_ROOT.lstat()
+        if (not stat.S_ISDIR(parent.st_mode) or (parent.st_uid, parent.st_gid) != (0, 0)
+                or stat.S_IMODE(parent.st_mode) != 0o711 or not stat.S_ISDIR(directory.st_mode)
+                or (directory.st_uid, directory.st_gid) != (0, 61001)
+                or stat.S_IMODE(directory.st_mode) != 0o710):
+            raise TrialFailure("RECOVERY_SOCKET_DIRECTORY_IDENTITY_INVALID")
+        socket_path = socket_dir / "lease.sock"
+        try:
+            socket_stat = socket_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISSOCK(socket_stat.st_mode):
+                raise TrialFailure("RECOVERY_SOCKET_TYPE_MISMATCH")
+            socket_path.unlink()
+        socket_dir.rmdir()
+    recovery_context["socket_absent"] = True
+    return volume
+
+
 def _run_dead_controller_recovery(*, temp_root, source_root, engine, image_id,
                                   source_digest, boot_id, recovery_context,
                                   dependency_archive, dependency_sha,
@@ -758,7 +901,7 @@ def _run_dead_controller_recovery(*, temp_root, source_root, engine, image_id,
         SecureLeaseV2Store, _kernel_boot_id,
     )
     from tools.document_nas_docker_named_volume_lifecycle import (
-        VolumeSpec, stop_owned_container, validate_volume_readback,
+        LifecycleError,
     )
 
     state_root = Path(temp_root) / "recovery-coordinator"
@@ -870,100 +1013,18 @@ def _run_dead_controller_recovery(*, temp_root, source_root, engine, image_id,
             current_boot_id=boot_id)
         if claimed is not True:
             raise TrialFailure("RECOVERY_CAS_CLAIM_FAILED")
-        current = store.read()
-        resources = current.docker_resources
-        creation = (resources.creations or {}).get("volume")
-        pin = (resources.pins or {}).get("volume")
-        volume = VolumeSpec.for_run(run_id)
-        actual = engine.inspect_volume(volume.name)
-        expected_pin = {"role":"volume", "resource_id":volume.name,
-            "image_id":"", "name":volume.name, "run_id":run_id,
-            "volume_name":volume.name, "driver":"local",
-            "labels":dict(volume.labels), "network_mode":""}
-        if (current.phase != "UNCERTAIN" or resources.state != "STOPPING"
-                or creation is None or creation.get("state") != "VERIFIED"
-                or creation.get("resource_id") != volume.name
-                or creation.get("name") != volume.name
-                or creation.get("run_id") != run_id
-                or creation.get("labels") != dict(volume.labels)
-                or pin != expected_pin or not isinstance(actual, dict)
-                or not validate_volume_readback(volume, actual)
-                or set(resources.pins or {}) != {"volume", "gateway", "tunnel"}
-                or set(resources.creations or {}) != {"volume", "gateway", "tunnel"}):
-            raise TrialFailure("RECOVERY_VOLUME_OWNERSHIP_UNVERIFIED")
-        mountpoint = actual.get("Mountpoint")
-        if not isinstance(mountpoint, str) or not mountpoint.startswith("/"):
-            raise TrialFailure("RECOVERY_VOLUME_MOUNTPOINT_INVALID")
         recovery_context["cas_claim"] = "PASS"
-        recovery_context["volume_mountpoint_readback"] = "PASS"
-        for role in ("tunnel", "gateway"):
-            role_pin = dict((resources.pins or {}).get(role, {}))
-            role_creation = dict((resources.creations or {}).get(role, {}))
-            expected_id = ready.get(role + "_id")
-            expected_name = ready.get(role + "_name")
-            if (role_pin.get("resource_id") != expected_id
-                    or role_creation.get("resource_id") != expected_id
-                    or role_creation.get("state") != "VERIFIED"
-                    or role_creation.get("name") != expected_name
-                    or role_creation.get("run_id") != run_id
-                    or role_pin.get("run_id") != run_id
-                    or role_pin.get("image_id") != image_id):
-                raise TrialFailure("RECOVERY_CONTAINER_CAS_IDENTITY_INVALID")
-            observed_container = engine.inspect_container(expected_id)
-            evidence = engine.inspect_image(image_id)
-            stopped = stop_owned_container(engine, role_creation, observed_container, 5,
-                image_labels=evidence.config_labels, expected_base_digest=BASE_DIGEST)
-            engine.collect_container_diagnostics(expected_id, run_id=run_id,
-                role=role, expected_name=expected_name, image_id=image_id)
-            engine.remove_container(expected_id)
-            if (engine.inspect_container(expected_id) is not None
-                    or engine.inspect_container_name(expected_name) is not None):
-                raise TrialFailure("RECOVERY_CONTAINER_ABSENCE_UNVERIFIED")
-            current = store.read()
-            if store.docker_trial_recovery_cas(current.sequence, run_id=run_id,
-                    claimant_pid=os.getpid(), claimant_start_ticks=_proc_ticks(os.getpid()),
-                    now=time.monotonic(), clear_role=role, verified_absent=True) is not True:
-                raise TrialFailure("RECOVERY_CONTAINER_CAS_CLEAR_FAILED")
-            recovery_context["{}_recovery".format(role)] = {
-                "status":"PASS", "container_absent":True,
-                "exit_code":stopped.get("State", {}).get("ExitCode") if isinstance(stopped, dict) else None}
-        if engine.remove_volume(volume.name) is not True:
-            raise TrialFailure("RECOVERY_VOLUME_REMOVE_FAILED")
-        if engine.inspect_volume(volume.name) is not None:
-            raise TrialFailure("RECOVERY_VOLUME_ABSENCE_UNVERIFIED")
-        current = store.read()
-        if store.docker_trial_recovery_cas(current.sequence, run_id=run_id,
-                claimant_pid=os.getpid(), claimant_start_ticks=_proc_ticks(os.getpid()),
-                now=time.monotonic(), clear_role="volume", verified_absent=True) is not True:
-            raise TrialFailure("RECOVERY_VOLUME_CAS_CLEAR_FAILED")
-        current = store.read()
-        if store.docker_trial_recovery_cas(current.sequence, run_id=run_id,
-                claimant_pid=os.getpid(), claimant_start_ticks=_proc_ticks(os.getpid()),
-                now=time.monotonic(), state="STOPPED") is not True:
-            raise TrialFailure("RECOVERY_CAS_STOPPED_FAILED")
-        final = store.read()
-        final_resources = final.docker_resources
-        if (engine.inspect_volume(volume.name) is not None or final.phase != "UNCERTAIN"
-                or final_resources is None or final_resources.state != "STOPPED"
-                or final_resources.pins or final_resources.creations
-                or final_resources.intent is None):
-            raise TrialFailure("RECOVERY_FINAL_RECONCILIATION_FAILED")
-        recovery_context["volume_absent"] = True
-        socket_dir_text = ready.get("socket_dir")
-        socket_dir = Path(socket_dir_text) if isinstance(socket_dir_text, str) else None
-        if (socket_dir is None or socket_dir.parent != SOCKET_ROOT
-                or socket_dir.name != run_id.replace("-", "")):
-            raise TrialFailure("RECOVERY_SOCKET_DIRECTORY_IDENTITY_INVALID")
-        socket_path = socket_dir / "lease.sock"
-        if socket_path.is_symlink():
-            raise TrialFailure("RECOVERY_SOCKET_PATH_SYMLINK")
-        if socket_path.exists():
-            socket_stat = os.lstat(str(socket_path))
-            if not stat.S_ISSOCK(socket_stat.st_mode):
-                raise TrialFailure("RECOVERY_SOCKET_TYPE_MISMATCH")
-            socket_path.unlink()
-        socket_dir.rmdir()
-        recovery_context["socket_absent"] = True
+        try:
+            volume = _reconcile_claimed_trial(store, engine, ready,
+                boot_id=boot_id, image_id=image_id, recovery_context=recovery_context)
+        except LifecycleError as exc:
+            if exc.code != "ENGINE_TRANSPORT_UNCERTAIN":
+                raise
+            # One bounded reconciliation after rereading the same claim and the exact resources.
+            recovery_context["transport_reconciliation"] = "ATTEMPTED"
+            volume = _reconcile_claimed_trial(store, engine, ready,
+                boot_id=boot_id, image_id=image_id, recovery_context=recovery_context)
+            recovery_context["transport_reconciliation"] = "PASS"
         # A historical intent remains audit data, but is not authority after
         # STOPPED: both a stale coordinator port and recovery CAS are rejected.
         from tools.document_nas_docker_lease_port import SecureDockerLeasePort
@@ -992,8 +1053,8 @@ def _run_dead_controller_recovery(*, temp_root, source_root, engine, image_id,
             "coordinator_exit_code":exited,
             "termination_to_reap_seconds":round(termination_to_reap, 3),
             "cas_claim":"PASS", "volume_pin_identity":"PASS",
-            "tunnel_exit_code":recovery_context["tunnel_recovery"]["exit_code"],
-            "gateway_exit_code":recovery_context["gateway_recovery"]["exit_code"],
+            "tunnel_exit_code":recovery_context.get("tunnel_recovery", {}).get("exit_code"),
+            "gateway_exit_code":recovery_context.get("gateway_recovery", {}).get("exit_code"),
             "volume_absent":"PASS", "gateway_absent":"PASS", "tunnel_absent":"PASS",
             "cas_terminal":"STOPPED",
             "pins_empty":True, "creation_records_empty":True,
