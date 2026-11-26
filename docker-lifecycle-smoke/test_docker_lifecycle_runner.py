@@ -199,6 +199,53 @@ port.record_created_resource(run_id,'volume',name); port.persist_volume_pin(run_
             expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
             volume_mountpoint=mountpoint)
         self.assertTrue(readback_checks_pass(one_shot), one_shot)
+
+        # Mount arrays are unordered in Docker's inspect responses. Both the
+        # create-time HostConfig and runtime Mounts must match by target.
+        reversed_observed = json.loads(json.dumps(observed))
+        reversed_body = json.loads(json.dumps(body))
+        reversed_observed["HostConfig"]["Mounts"].reverse()
+        reversed_observed["Mounts"].reverse()
+        reversed_body["HostConfig"]["Mounts"].reverse()
+        for status in ("created", "running"):
+            reversed_observed["State"]["Status"] = status
+            checks = container_readback_checks(spec, reversed_observed,
+                expected_state=status, expected_container_id=cid,
+                image_labels=image_labels,
+                expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+                volume_mountpoint=mountpoint)
+            self.assertTrue(readback_checks_pass(checks), checks)
+        reversed_observed["State"]["Status"] = "created"
+        reversed_one_shot = DockerEngineV141._one_shot_readback_checks(spec.name,
+            reversed_body, reversed_observed, cid, image_id, 201326592, 64, [],
+            image_labels=image_labels,
+            expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+            volume_mountpoint=mountpoint)
+        self.assertTrue(readback_checks_pass(reversed_one_shot), reversed_one_shot)
+
+        for key in ("HostConfig.Mounts", "Mounts"):
+            for mutation in ("missing", "extra", "duplicate", "discordant"):
+                bad = json.loads(json.dumps(observed))
+                items = (bad["HostConfig"]["Mounts"] if key == "HostConfig.Mounts"
+                         else bad["Mounts"])
+                if mutation == "missing":
+                    items.pop()
+                elif mutation == "extra":
+                    items.append(dict(items[0]))
+                    items[-1]["Target" if key == "HostConfig.Mounts" else "Destination"] = "/tmp/extra"
+                elif mutation == "duplicate":
+                    items[1] = dict(items[0])
+                elif key == "HostConfig.Mounts":
+                    items[1]["Source"] = "/run/foreign.sock"
+                else:
+                    items[1]["Source"] = "/run/foreign.sock"
+                checks = container_readback_checks(spec, bad,
+                    expected_state="created", expected_container_id=cid,
+                    image_labels=image_labels,
+                    expected_base_digest="sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363",
+                    volume_mountpoint=mountpoint)
+                self.assertFalse(readback_checks_pass(checks), (key, mutation, checks))
+
         bad_one_shot = json.loads(json.dumps(observed))
         bad_one_shot["HostConfig"]["RestartPolicy"]["MaximumRetryCount"] = 1
         rejected = DockerEngineV141._one_shot_readback_checks(spec.name, body, bad_one_shot,
