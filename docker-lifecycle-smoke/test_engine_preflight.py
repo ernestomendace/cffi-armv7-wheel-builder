@@ -38,6 +38,7 @@ import contextlib, importlib.util, io, json, pathlib, subprocess, sys, tempfile
 root = pathlib.Path(sys.argv[1])
 spec = importlib.util.spec_from_file_location("private_trial_entrypoint", root / "tools/docker_trial_container_entrypoint.py")
 entry = importlib.util.module_from_spec(spec); spec.loader.exec_module(entry)
+compile(entry._gateway_child_bootstrap(), "<gateway-child>", "exec")
 with tempfile.TemporaryDirectory() as td:
     site = pathlib.Path(td)
     (site / "offline_probe_dependency.py").write_text("ORIGIN = 'offline-site'\n")

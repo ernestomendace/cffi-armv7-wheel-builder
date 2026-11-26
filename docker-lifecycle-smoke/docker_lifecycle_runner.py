@@ -839,6 +839,7 @@ def _run_dead_controller_recovery(*, temp_root, source_root, engine, image_id,
                 or os.path.realpath(before_signal.get("exe_path", ""))
                     != os.path.realpath(sys.executable)):
             raise TrialFailure("RECOVERY_COORDINATOR_IDENTITY_CHANGED_BEFORE_SIGNAL")
+        termination_started = time.monotonic()
         child.send_signal(15)
         try:
             _, stderr_text = child.communicate(timeout=5.0)
@@ -850,6 +851,7 @@ def _run_dead_controller_recovery(*, temp_root, source_root, engine, image_id,
                 raise TrialFailure("RECOVERY_COORDINATOR_KILL_IDENTITY_UNVERIFIED")
             child.kill()
             _, stderr_text = child.communicate(timeout=3.0)
+        termination_to_reap = time.monotonic() - termination_started
         exited = child.returncode
         if exited != -15:
             raise TrialFailure("RECOVERY_COORDINATOR_TERMINATION_UNEXPECTED")
@@ -1002,7 +1004,7 @@ def _run_dead_controller_recovery(*, temp_root, source_root, engine, image_id,
         result = {"status":"PASS", "run_id":run_id,
             "coordinator_pid":pid, "coordinator_start_ticks":ticks,
             "coordinator_exit_code":exited,
-            "termination_to_reap_seconds":round(time.monotonic() - started, 3),
+            "termination_to_reap_seconds":round(termination_to_reap, 3),
             "cas_claim":"PASS", "volume_pin_identity":"PASS",
             "volume_absent":"PASS", "gateway_absent":"PASS", "tunnel_absent":"PASS",
             "cas_terminal":"STOPPED",
@@ -1313,7 +1315,7 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
                 raise TrialFailure("GATEWAY_EXITED_DURING_E2E")
             tunnel_logs = engine.collect_container_diagnostics(lifecycle.ids["tunnel"],
                 run_id=run_id, role="tunnel", expected_name=tunnel_name, image_id=image)
-            records = (tunnel_logs.get("stdout_records", [])
+            records = (tunnel_logs.get("stdout_records", []) + tunnel_logs.get("stderr_records", [])
                        if tunnel_logs.get("status") == "PASS" else [])
             e2e_event = next((item for item in records
                 if item.get("phase") in {"mcp_e2e_complete", "mcp_e2e_failed"}), None)
@@ -1661,6 +1663,15 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         result_path = result_dir / "docker-trial-report.json"
         result_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="ascii")
         os.chmod(result_path, 0o600)
+    cleanup_kind = "AFTER_FAILURE" if report.get("primary_error") else "ORDINARY"
+    cleanup_passed = (report.get("cleanup") == "PASS"
+        and report.get("resource_absence_verified") is True
+        and report.get("controller_state_cleanup") == "PASS"
+        and report.get("status") != "FAIL_CLEANUP")
+    print("DOCKER_TRIAL_RECONCILIATION_{}={}".format(
+        cleanup_kind, "PASS" if cleanup_passed else "UNCONFIRMED"))
+    print("DOCKER_TRIAL_RESOURCE_ABSENCE={}".format(
+        "PASS" if report.get("resource_absence_verified") is True else "UNCONFIRMED"))
     print("DOCKER_TRIAL_STATUS=" + str(report["status"]))
     for name in ("A_readback_failure_cleanup_regression", "IMAGE_SENTINEL_PREFLIGHT",
                  "A_volume_init_readback",

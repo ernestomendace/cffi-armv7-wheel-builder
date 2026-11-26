@@ -140,7 +140,8 @@ jobs:
             --source "$RUNNER_TEMP/docker-trial-inputs/source/application" \
             --dependencies "$RUNNER_TEMP/docker-trial-inputs/dependency-bundle.tar.gz" \
             --dependency-sha256 "$(sha256sum "$RUNNER_TEMP/docker-trial-inputs/dependency-bundle.tar.gz" | cut -d' ' -f1)" \
-            --image-iid "$RUNNER_TEMP/docker-trial-inputs/image.iid"
+            --image-iid "$RUNNER_TEMP/docker-trial-inputs/image.iid" |
+            tee >(grep -Ex 'DOCKER_TRIAL_(RECONCILIATION_(AFTER_FAILURE|ORDINARY)|RESOURCE_ABSENCE)=(PASS|UNCONFIRMED)' >> "$GITHUB_STEP_SUMMARY")
 
       - name: Remove only the image built for this run
         id: image_cleanup
