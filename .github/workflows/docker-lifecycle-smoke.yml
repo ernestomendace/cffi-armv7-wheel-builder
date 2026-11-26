@@ -74,6 +74,7 @@ jobs:
           set -euo pipefail
           PYTHONPATH="docker-lifecycle-smoke:$DOCKER_TRIAL_SOURCE_ROOT" \
             python3 -B -m unittest \
+            test_engine_preflight.DockerEnginePreflightTests.test_gateway_isolated_child_receives_offline_site_and_sanitized_import_diagnostic \
             test_engine_preflight.DockerEnginePreflightTests.test_actual_generated_synthetic_configuration_passes_canonical_validator \
             test_engine_preflight.DockerEnginePreflightTests.test_tunnel_is_created_and_pinned_after_peer_auth_before_tunnel_id_reads \
             test_engine_preflight.DockerEnginePreflightTests.test_tunnel_volume_identity_survives_cas_intent_pin_reload_and_cleanup \

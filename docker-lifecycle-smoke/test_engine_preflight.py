@@ -1,8 +1,8 @@
 import os
 import hashlib
+import json
 import tempfile
 import unittest
-import json
 import subprocess
 import sys
 import time
@@ -19,6 +19,67 @@ from docker_lifecycle_runner import (
 
 
 class DockerEnginePreflightTests(unittest.TestCase):
+    def test_gateway_isolated_child_receives_offline_site_and_sanitized_import_diagnostic(self):
+        source_root = os.environ.get("DOCKER_TRIAL_SOURCE_ROOT")
+        if not source_root:
+            if os.environ.get("DOCKER_TRIAL_REQUIRE_PRIVATE_ENTRYPOINT_TEST") == "1":
+                self.fail("PRIVATE_SOURCE_REQUIRED_FOR_GATEWAY_IMPORT_REGRESSION")
+            self.skipTest("private trial source not staged in preflight-only invocation")
+        source_root = Path(source_root).resolve(strict=True)
+        entrypoint = source_root / "tools/docker_trial_container_entrypoint.py"
+        engine_module = source_root / "tools/document_nas_docker_engine_v141.py"
+        self.assertTrue(entrypoint.is_file())
+        self.assertTrue(engine_module.is_file())
+        entry_source = entrypoint.read_text(encoding="utf-8")
+        self.assertIn('str(root / "site"), str(app / "src")', entry_source)
+        self.assertIn('config, factory = sys.argv[5:]', entry_source)
+        code = r'''
+import contextlib, importlib.util, io, json, pathlib, subprocess, sys, tempfile
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("private_trial_entrypoint", root / "tools/docker_trial_container_entrypoint.py")
+entry = importlib.util.module_from_spec(spec); spec.loader.exec_module(entry)
+with tempfile.TemporaryDirectory() as td:
+    site = pathlib.Path(td)
+    (site / "offline_probe_dependency.py").write_text("ORIGIN = 'offline-site'\n")
+    bootstrap = entry.GATEWAY_CHILD_IMPORT_BOOTSTRAP + (
+        "import importlib.util, json; "
+        "mods = {name:importlib.util.find_spec(name).origin for name in "
+        "('offline_probe_dependency','scripts.validate_mcp_oauth_runtime_config','mcp_document_oauth_entrypoint')}; "
+        "print(json.dumps(mods))"
+    )
+    out = subprocess.run([sys.executable, "-I", "-c", bootstrap,
+        str(site), str(root / "src"), str(root / "scripts"), str(root)],
+        capture_output=True, text=True, timeout=15)
+    assert out.returncode == 0, out.stderr[-1000:]
+    value = json.loads(out.stdout)
+    assert str(site) in value['offline_probe_dependency']
+    assert str(root / 'scripts') in value['scripts.validate_mcp_oauth_runtime_config']
+    assert str(root / 'src') in value['mcp_document_oauth_entrypoint']
+sys.path.insert(0, str(root))
+from tools.document_nas_docker_engine_v141 import _safe_application_log_records
+try:
+    import codex_trial_missing_private_test_module
+except ModuleNotFoundError as exc:
+    details = entry._exception_diagnostic(exc)
+stream = io.StringIO()
+with contextlib.redirect_stderr(stream):
+    entry._emit_event(mode='tunnel', status='FAIL', phase='mcp_e2e_failed',
+        operation='http_oauth_mcp_readonly_fixture', code='MCP_E2E_FAILED',
+        exception_class=details['exception_class'], diagnostics={'missing_module':details.get('missing_module')})
+record = json.loads(stream.getvalue())
+safe = _safe_application_log_records(stream.getvalue().encode())
+assert safe and safe[0]['diagnostics']['missing_module'] == record['diagnostics']['missing_module']
+assert record['diagnostics']['missing_module'] == 'codex_trial_missing_private_test_module'
+record['diagnostics']['missing_module'] = '/private/path/secret'
+unsafe = _safe_application_log_records(json.dumps(record).encode())
+assert unsafe and 'diagnostics' not in unsafe[0]
+print('GATEWAY_IMPORT_REGRESSION_PASS')
+'''
+        result = subprocess.run([sys.executable, "-B", "-c", code, str(source_root)],
+            capture_output=True, text=True, timeout=25, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertIn("GATEWAY_IMPORT_REGRESSION_PASS", result.stdout)
+
     def test_built_image_permission_check_gates_trial_and_runs_before_it(self):
         root = Path(__file__).resolve().parent.parent
         workflow = (root / ".github/workflows/docker-lifecycle-smoke.yml").read_text()
