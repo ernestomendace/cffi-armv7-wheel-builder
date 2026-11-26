@@ -36,10 +36,11 @@ class RunnerDiagnosticsTests(unittest.TestCase):
             app_root, site_root=app_root / "python" / "site")
         self.assertEqual(tunnel_paths[1:], [str(app_root), str(app_root / "src"),
                                             str(app_root / "scripts")])
+        offline_site = app_root / "python" / "site"
         code = (entry.GATEWAY_CHILD_IMPORT_BOOTSTRAP +
                 "import scripts.validate_mcp_oauth_runtime_config; print('IMPORT_PATH_PASS')")
         result = subprocess.run([sys.executable, "-I", "-c", code,
-            str(app_root / "src"), str(app_root / "scripts"), str(app_root)],
+            str(offline_site), str(app_root / "src"), str(app_root / "scripts"), str(app_root)],
             capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr[-1200:])
         self.assertIn("IMPORT_PATH_PASS", result.stdout)
