@@ -272,6 +272,111 @@ print('GATEWAY_IMPORT_REGRESSION_PASS')
             and node.func.value.id == "threading"
             for node in ast.walk(tree)))
 
+    def test_private_tunnel_sigterm_drains_http_handlers(self):
+        source_root = os.environ.get("DOCKER_TRIAL_SOURCE_ROOT")
+        if not source_root:
+            self.skipTest("private source is not staged")
+        import select
+        import socket
+        import urllib.request
+
+        code = """
+import os, sys, uuid
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "tools"))
+import docker_trial_container_entrypoint as entry
+entry.APP_UID, entry.APP_GID = os.geteuid(), os.getegid()
+entry.RUNTIME = root.parents[1]
+sys.path.insert(0, str(root / "src"))
+original = entry._SyntheticTunnelServer
+class EphemeralServer(original):
+    def __init__(self, address):
+        super().__init__((address[0], 0))
+        print(self.server_address[1], flush=True)
+entry._SyntheticTunnelServer = EphemeralServer
+os.environ["MCP_SYNTHETIC_TUNNEL"] = "1"
+os.environ.pop("MCP_DOCKER_TRIAL_FULL_RUNTIME", None)
+raise SystemExit(entry._tunnel(["--run-id", str(uuid.uuid4())]))
+"""
+        with subprocess.Popen([sys.executable, "-I", "-B", "-c", code, source_root],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+            try:
+                self.assertTrue(select.select([child.stdout], [], [], 4.0)[0])
+                port = int(child.stdout.readline())
+                with urllib.request.urlopen(
+                        "http://127.0.0.1:{}/healthz".format(port), timeout=2) as response:
+                    self.assertEqual(json.load(response), {"status": "ok"})
+                with socket.create_connection(("127.0.0.1", port), timeout=2) as incomplete:
+                    incomplete.sendall(b"GET /healthz HTTP/1.0\r\n")
+                    child.terminate()
+                    _, stderr = child.communicate(timeout=4)
+                    self.assertEqual(incomplete.recv(1), b"")
+                self.assertEqual(child.returncode, 0, stderr)
+                events = [json.loads(line) for line in stderr.splitlines() if line.startswith("{")]
+                self.assertTrue(any(event.get("status") == "PASS"
+                    and event.get("phase") == "tunnel_shutdown" for event in events))
+            finally:
+                if child.poll() is None:
+                    child.kill()
+
+    def test_owned_stop_rejects_forced_exit_and_rechecks_uncertain_transport(self):
+        if not os.environ.get("DOCKER_TRIAL_SOURCE_ROOT"):
+            self.skipTest("private source is not staged")
+        from tools.document_nas_docker_named_volume_lifecycle import (
+            LifecycleError, stop_owned_container,
+        )
+        cid = "e" * 64
+        image = "sha256:" + "a" * 64
+        creation = {"role":"tunnel", "name":"trial-tunnel", "run_id":"run",
+                    "resource_id":cid, "state":"VERIFIED", "image_id":image}
+        container = {"Id":cid, "Name":"/trial-tunnel", "Config":{"Image":image,
+            "Labels":{"codex.mcp.trial":"1", "codex.mcp.run":"run",
+                      "codex.mcp.role":"tunnel"}}, "State":{"Status":"running"}}
+        engine = mock.Mock()
+        engine.stop_container.return_value = True
+        def call():
+            return stop_owned_container(engine, creation, container, 5,
+                image_labels=None, expected_base_digest=image, require_clean_exit=True)
+        state = {"Status":"exited", "ExitCode":0, "OOMKilled":False, "Error":""}
+        engine.inspect_container.return_value = dict(container, State=state)
+        self.assertEqual(call()["State"]["ExitCode"], 0)
+        state["ExitCode"] = 137
+        with self.assertRaisesRegex(LifecycleError, "ORDINARY_STOP_NOT_CLEAN"):
+            call()
+        engine.stop_container.side_effect = LifecycleError("ENGINE_TRANSPORT_UNCERTAIN")
+        with self.assertRaisesRegex(LifecycleError, "ENGINE_TRANSPORT_UNCERTAIN") as error:
+            call()
+        self.assertEqual(error.exception.diagnostics["stop_readback_state"], "exited")
+        engine.inspect_container.assert_called_with(cid)
+        engine.inspect_container.return_value = dict(container, Id="f" * 64)
+        with self.assertRaises(LifecycleError) as mismatch:
+            call()
+        self.assertEqual(mismatch.exception.diagnostics["stop_readback_state"], "UNVERIFIED")
+        engine.remove_container.assert_not_called()
+
+    def test_stop_response_budget_preserves_daemon_grace_and_other_timeouts(self):
+        if not os.environ.get("DOCKER_TRIAL_SOURCE_ROOT"):
+            self.skipTest("private source is not staged")
+        from tools import document_nas_docker_engine_v141 as engine_module
+        engine = object.__new__(engine_module.DockerEngineV141)
+        engine.socket_path = "/synthetic/socket"
+        engine._socket_file_identity = None
+        engine._current_socket_identity = lambda: None
+        engine._verify_peer = False
+        engine.timeout = 5.0
+        cid = "e" * 64
+        with mock.patch.object(engine_module, "_UnixHTTPConnection") as connection:
+            response = connection.return_value.getresponse.return_value
+            response.status = 204
+            response.read.return_value = b""
+            self.assertTrue(engine.stop_container(cid, 5))
+            connection.assert_called_once_with(engine.socket_path, 7.0)
+            self.assertTrue(connection.return_value.request.call_args.args[1].endswith("/stop?t=5"))
+            connection.reset_mock()
+            self.assertTrue(engine.start_container(cid))
+            connection.assert_called_once_with(engine.socket_path, 5.0)
+
     def test_cas_deadline_expiry_is_distinct_from_operational_stop(self):
         source = (Path(__file__).resolve().parent / "docker_lifecycle_runner.py").read_text()
         probe = source.index('current_phase = "E_cas_deadline_expiry_rejection"')

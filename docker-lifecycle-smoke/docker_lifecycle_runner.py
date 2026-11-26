@@ -626,7 +626,9 @@ def _remove_auxiliary_volume(*, context, engine):
 
 def _cleanup_auxiliary_context(*, context, engine, expected_base_digest):
     """Reconcile only exact ID/name/image/run/role objects in this auxiliary CAS."""
-    from tools.document_nas_docker_named_volume_lifecycle import _container_belongs_to_creation
+    from tools.document_nas_docker_named_volume_lifecycle import (
+        _container_belongs_to_creation, stop_owned_container,
+    )
     run_id, port = context["run_id"], context["port"]
     name = "codex-mcp-trial-install-" + run_id.replace("-", "")
     actual = engine.inspect_container_name(name)
@@ -648,13 +650,8 @@ def _cleanup_auxiliary_context(*, context, engine, expected_base_digest):
                 expected_base_digest=expected_base_digest):
             raise TrialFailure("AUX_CONTAINER_OWNERSHIP_UNVERIFIED")
         cid = actual.get("Id")
-        state = actual.get("State", {}).get("Status")
-        if state == "running":
-            engine.stop_container(cid, 5)
-            actual = engine.inspect_container(cid)
-            state = actual.get("State", {}).get("Status") if isinstance(actual, dict) else None
-        if state not in ("created", "exited", "dead"):
-            raise TrialFailure("AUX_CONTAINER_STATE_UNCERTAIN")
+        stop_owned_container(engine, creation, actual, 5,
+            image_labels=evidence.config_labels, expected_base_digest=expected_base_digest)
         collector = getattr(engine, "collect_container_diagnostics", None)
         if callable(collector):
             collector(cid, run_id=run_id, role="installer",
@@ -761,7 +758,7 @@ def _run_dead_controller_recovery(*, temp_root, source_root, engine, image_id,
         SecureLeaseV2Store, _kernel_boot_id,
     )
     from tools.document_nas_docker_named_volume_lifecycle import (
-        VolumeSpec, _container_belongs_to_creation, validate_volume_readback,
+        VolumeSpec, stop_owned_container, validate_volume_readback,
     )
 
     state_root = Path(temp_root) / "recovery-coordinator"
@@ -914,21 +911,10 @@ def _run_dead_controller_recovery(*, temp_root, source_root, engine, image_id,
                 raise TrialFailure("RECOVERY_CONTAINER_CAS_IDENTITY_INVALID")
             observed_container = engine.inspect_container(expected_id)
             evidence = engine.inspect_image(image_id)
-            if (not isinstance(observed_container, dict)
-                    or observed_container.get("Id") != expected_id
-                    or not _container_belongs_to_creation(role_creation,
-                        observed_container, image_labels=evidence.config_labels,
-                        expected_base_digest=BASE_DIGEST)):
-                raise TrialFailure("RECOVERY_CONTAINER_OWNERSHIP_UNVERIFIED")
+            stopped = stop_owned_container(engine, role_creation, observed_container, 5,
+                image_labels=evidence.config_labels, expected_base_digest=BASE_DIGEST)
             engine.collect_container_diagnostics(expected_id, run_id=run_id,
                 role=role, expected_name=expected_name, image_id=image_id)
-            state = observed_container.get("State", {}).get("Status")
-            if state == "running" and engine.stop_container(expected_id, 5) is not True:
-                raise TrialFailure("RECOVERY_CONTAINER_STOP_FAILED")
-            stopped = engine.inspect_container(expected_id)
-            stopped_state = stopped.get("State", {}).get("Status") if isinstance(stopped, dict) else None
-            if stopped_state not in {"created", "exited", "dead"}:
-                raise TrialFailure("RECOVERY_CONTAINER_STOP_READBACK_FAILED")
             engine.remove_container(expected_id)
             if (engine.inspect_container(expected_id) is not None
                     or engine.inspect_container_name(expected_name) is not None):
@@ -1006,6 +992,8 @@ def _run_dead_controller_recovery(*, temp_root, source_root, engine, image_id,
             "coordinator_exit_code":exited,
             "termination_to_reap_seconds":round(termination_to_reap, 3),
             "cas_claim":"PASS", "volume_pin_identity":"PASS",
+            "tunnel_exit_code":recovery_context["tunnel_recovery"]["exit_code"],
+            "gateway_exit_code":recovery_context["gateway_recovery"]["exit_code"],
             "volume_absent":"PASS", "gateway_absent":"PASS", "tunnel_absent":"PASS",
             "cas_terminal":"STOPPED",
             "pins_empty":True, "creation_records_empty":True,
@@ -1398,7 +1386,8 @@ def run(source_root: Path, dependency_archive: Path, dependency_sha: str, image_
         deadline_started = time.monotonic()
         lifecycle.deadline_stop(deadline_monotonic=deadline_started + 5.0)
         report["deadline_stop"] = {"status":"PASS", "requested_seconds":5.0,
-            "elapsed_seconds":round(time.monotonic() - deadline_started, 3)}
+            "elapsed_seconds":round(time.monotonic() - deadline_started, 3),
+            "exit_codes":{"gateway":0, "tunnel":0}}
         post_expiry = {}
         try:
             post_expiry["heartbeat_rejected"] = port.heartbeat(run_id) is not True

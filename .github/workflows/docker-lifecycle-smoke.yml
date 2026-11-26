@@ -79,6 +79,9 @@ jobs:
             test_engine_preflight.DockerEnginePreflightTests.test_tunnel_is_created_and_pinned_after_peer_auth_before_tunnel_id_reads \
             test_engine_preflight.DockerEnginePreflightTests.test_tunnel_volume_identity_survives_cas_intent_pin_reload_and_cleanup \
             test_engine_preflight.DockerEnginePreflightTests.test_private_tunnel_entrypoint_imports_threading_for_health_server \
+            test_engine_preflight.DockerEnginePreflightTests.test_private_tunnel_sigterm_drains_http_handlers \
+            test_engine_preflight.DockerEnginePreflightTests.test_owned_stop_rejects_forced_exit_and_rechecks_uncertain_transport \
+            test_engine_preflight.DockerEnginePreflightTests.test_stop_response_budget_preserves_daemon_grace_and_other_timeouts \
             test_engine_preflight.DockerEnginePreflightTests.test_cas_deadline_expiry_is_distinct_from_operational_stop \
             test_engine_preflight.DockerEnginePreflightTests.test_real_secure_store_rejects_resource_mutation_after_deadline_before_stopped \
             test_engine_preflight.DockerEnginePreflightTests.test_linux_real_monotonic_cas_expiry_regression \
